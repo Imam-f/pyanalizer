@@ -18,6 +18,8 @@ settings = {"mode": "fast", "retries": 3}
 settings["verbose"] = True
 
 
+# --- Settings readers -------------------------------------------------------
+
 def configured_mode() -> str:
     assert isinstance(settings["mode"], str)
     return settings["mode"]
@@ -27,6 +29,8 @@ def configured_retries() -> int:
     assert isinstance(settings["retries"], int)
     return settings["retries"]
 
+
+# --- Closures and captures --------------------------------------------------
 
 def make_handlers(prefix: str) -> tuple[Callable[[str], str], Callable[[], int]]:
     history: list[str] = []
