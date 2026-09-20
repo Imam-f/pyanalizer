@@ -32,12 +32,19 @@ No manual virtual-environment setup is needed:
 uv run pyanalyzer examples/demo.py
 uv run pyanalyzer --color always examples/demo.py
 uv run pyanalyzer --json examples/demo.py
+# Open the interactive syntax-highlighted symbol inspector:
+uv run pyanalyzer-gui examples/demo.py
 # Equivalent module form:
 uv run python -m pyanalyzer examples/demo.py
 ```
 
 Analyze several files at once by passing multiple paths. The JSON form returns
 one object for one input and a list for multiple inputs.
+
+The GUI analyzes edits as you type. Hover a symbol in the code editor or the
+right sidebar to see its inferred type, state, source locations, sharing, and
+other available properties. Matching symbol occurrences are highlighted, and
+double-clicking a sidebar symbol with a known location jumps to its line.
 
 Human-readable output uses color automatically in an interactive terminal and
 adds whitespace between variables, guarantees, functions, classes, and their detail

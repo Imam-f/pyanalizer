@@ -10,6 +10,7 @@ dependencies = []
 
 [project.scripts]
 pyanalyzer = "pyanalyzer.cli:main"
+pyanalyzer-gui = "pyanalyzer.gui:main"
 
 [dependency-groups]
 dev = [
@@ -26,4 +27,3 @@ packages = ["src/pyanalyzer"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-
