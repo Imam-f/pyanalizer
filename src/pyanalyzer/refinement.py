@@ -26,34 +26,35 @@ class Guarantee(Generic[Value]):
         self.__pyanalyzer_guarantee__ = True
 
     def __call__(self, value: Value) -> Value:
-        """Return *value* itself without executing the declaration body."""
+        """Validate *value* and return that exact value when the check passes."""
+        self.declaration(value)
         return value
 
 
 def guarantee(declaration: Callable[[Value], Any]) -> Guarantee[Value]:
-    """Declare an identity function carrying one static guarantee.
+    """Declare a validating identity function carrying a refinement guarantee.
 
-    The decorated function's body is not a runtime validator.  The resulting
-    :class:`Guarantee` remains callable and returns its argument unchanged;
-    ``pyanalyzer`` reads its name as the guarantee attached to that value.
+    The declaration body is executed, so it can enforce its condition with an
+    ``assert`` before returning the value. The resulting :class:`Guarantee`
+    returns its argument unchanged on success; ``pyanalyzer`` attaches the
+    guarantee name to the successful value's type.
     """
     return Guarantee(declaration)
 
 
 # ``prop`` remains available for existing source files.  Prefer ``guarantee``
-# for new code, which better communicates the non-validating behavior.
+# for new code, which better communicates the validating refinement behavior.
 prop = guarantee
 
 
 def join(value: Value, guarantees: Iterable[Guarantee[Any]]) -> Value:
     """Attach several guarantees to *value* without imposing an order.
 
-    This is also an identity at runtime.  For example,
+    Every guarantee is checked, and the original value is returned. For example,
     ``join(number, (odd, positive))`` has the same value as ``number`` while
     the analyzer records an unordered pair of guarantees.
     """
 
-    # Accept and deliberately ignore the iterable so generators are not
-    # consumed merely to carry static information.
-    del guarantees
+    for check in guarantees:
+        check(value)
     return value

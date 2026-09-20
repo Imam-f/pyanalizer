@@ -103,13 +103,29 @@ def _type_line(name: str, value: TypeReport, colors: _Palette, indent: str = "  
     observed = ", ".join(value.observed)
     locations = ", ".join(map(str, value.locations))
     evidence = colors.detail(f"observed: {observed}; lines: {locations}")
-    return f"{indent}{colors.name(name)}: {colors.type(value.inferred)}  [{evidence}]"
+    state = f"{colors.keyword(value.mutability)}, {colors.keyword(value.sharing)}"
+    shared = (
+        f"; {colors.detail('with')}: {', '.join(value.shared_with)}"
+        if value.shared_with else ""
+    )
+    return (
+        f"{indent}{colors.name(name)}: {colors.type(value.inferred)}  "
+        f"[{state}{shared}; {evidence}]"
+    )
 
 
 def _render_function(function: FunctionReport, colors: _Palette, indent: str = "") -> list[str]:
     prefix = f"{indent}  "
     detail = f"{colors.keyword('function')} {colors.name(function.qualified_name)}"
     lines = [f"{indent}{detail}: {colors.type(function.signature)}"]
+
+    if function.parameter_variables:
+        group = [f"{prefix}{colors.heading('parameters')}"]
+        group.extend(
+            _type_line(name, value, colors, prefix + "  ")
+            for name, value in function.parameter_variables.items()
+        )
+        _add_group(lines, group)
 
     if function.props:
         _add_group(lines, [f"{prefix}{colors.heading('local guarantees')}"])
@@ -238,19 +254,58 @@ def _render(report: AnalysisReport, *, color: bool = False) -> str:
                 block.append("")
             bases = f"({', '.join(class_.bases)})" if class_.bases else ""
             block.append(f"  {colors.keyword('class')} {colors.name(class_.qualified_name)}{bases}")
+            if (
+                class_.inherited_class_variables
+                or class_.inherited_instance_attributes
+                or class_.inherited_methods
+            ):
+                block.append(f"    {colors.heading('inherited members')}")
+                for name, value in class_.inherited_class_variables.items():
+                    block.append(
+                        f"      {colors.detail('class')}: "
+                        + _type_line(name, value, colors)
+                    )
+                for name, value in class_.inherited_instance_attributes.items():
+                    block.append(
+                        f"      {colors.detail('instance')}: "
+                        + _type_line(name, value, colors)
+                    )
+                for name, signature in class_.inherited_methods.items():
+                    block.append(
+                        f"      {colors.detail('method')}: {colors.name(name)}: "
+                        f"{colors.type(signature)}"
+                    )
+            if class_.class_body_attributes:
+                block.append(f"    {colors.heading('class-body attributes')}")
+                block.extend(
+                    _type_line(name, value, colors, "      ")
+                    for name, value in class_.class_body_attributes.items()
+                )
+            if class_.initializer_attributes:
+                block.append(f"    {colors.heading('initialized attributes')}")
+                block.extend(
+                    _type_line(name, value, colors, "      ")
+                    for name, value in class_.initializer_attributes.items()
+                )
+            if class_.dynamic_attributes:
+                block.append(f"    {colors.heading('method-added attributes')}")
+                block.extend(
+                    _type_line(name, value, colors, "      ")
+                    for name, value in class_.dynamic_attributes.items()
+                )
             if class_.class_variables:
-                block.append(f"    {colors.heading('class variables')}")
+                block.append(f"    {colors.heading('flattened class variables')}")
                 block.extend(
                     _type_line(name, value, colors, "      ") for name, value in class_.class_variables.items()
                 )
             if class_.instance_attributes:
-                block.append(f"    {colors.heading('instance attributes')}")
+                block.append(f"    {colors.heading('flattened instance attributes')}")
                 block.extend(
                     _type_line(name, value, colors, "      ") for name, value in class_.instance_attributes.items()
                 )
             if class_.methods:
                 block.append("")
-                block.append(f"    {colors.heading('methods')}")
+                block.append(f"    {colors.heading('flattened methods')}")
                 for method_index, method in enumerate(class_.methods):
                     if method_index:
                         block.append("")

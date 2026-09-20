@@ -7,6 +7,8 @@ inspected**.
 It reports:
 
 - module, local, class, and instance-attribute types;
+- per-variable `const`/`mutable` and `single`/`shared` state, including the
+  scopes sharing captured variables and attributes;
 - literal evidence and widened types (`Literal[1]` becomes `int` when joined);
 - unions created by multiple assignments or branches;
 - numeric promotion (`int + float` becomes `float`);
@@ -14,6 +16,8 @@ It reports:
 - function and lambda `Callable` types;
 - same-file `super()` traversal, including inherited instance attributes and
   return types from resolved base methods;
+- class member origins (class body, `__init__`, and other methods), plus
+  flattened inherited class variables, instance attributes, and methods;
 - identity `@guarantee` declarations that construct refinement types;
 - nested-function captures, including `single` versus `shared` and `mutable`
   versus `read-only` captures.
@@ -64,6 +68,15 @@ inferred types. For example, assignments of `1` and `"one"` are shown as
 observations `Literal[1]` and `Literal['one']`, with the inferred type
 `Union[int, str]`. An explicit annotation is preserved as the inferred type.
 
+Every reported binding carries variable state. `const` means no reassignment
+or value mutation was detected; `mutable` covers repeated assignment,
+augmented assignment, item/attribute writes, and common mutating calls such as
+`append` or `update`. This is a static observation, not a claim that the
+runtime object is deeply immutable. `shared` follows capture ownership: more
+than one nested scope or class method uses the variable or attribute. The
+`shared_with` list identifies those scopes; otherwise the state is `single`.
+Function parameters receive the same state analysis.
+
 A capture is `shared` when more than one nested function captures the same
 owner-local variable. It is mutable when a closure uses `nonlocal`, assigns
 through an attribute/subscript, or calls a common mutating method such as
@@ -77,14 +90,16 @@ explicitly unresolved.
 
 Functions decorated with `@guarantee` are guarantees and implicit
 refinement-type constructors. A guarantee accepts a value and returns that
-exact value at runtime; it does not validate it. The decorator creates a
-generic `Guarantee[T]` callable, so ordinary type checkers see
-`positive(value: int) -> int` even without pyanalyzer support. For pyanalyzer,
+exact value at runtime after executing its declaration. Put an `assert` in the
+declaration to enforce the guarantee; a failed check raises `AssertionError`.
+The declaration still returns the original value. The decorator creates a generic `Guarantee[T]` callable,
+so ordinary type checkers see the decorated object as accepting and returning
+the original value type. For pyanalyzer,
 `positive(value)` is reported as `Refined[int, positive]`, while
 `odd(positive(value))` preserves the ordered composition as
 `Refined[Refined[int, positive], odd]`. Use `join(value, (odd, positive))`
-when the guarantees are unordered; it is also an identity function and is
-reported as `Refined[int, {odd, positive}]`. For a refinement annotation that
+when the guarantees are unordered; it checks every guarantee and is reported
+as `Refined[int, {odd, positive}]`. For a refinement annotation that
 also passes ordinary type checking, use `Annotated[int, positive]`; the type
 checker treats it as `int`, while pyanalyzer reports `Refined[int, positive]`.
 `prop` remains a compatibility alias for `guarantee`.
@@ -105,10 +120,12 @@ from pyanalyzer import guarantee, join
 
 @guarantee
 def positive(value: int) -> int:
+    assert value > 0
     return value
 
 @guarantee
 def odd(value: int) -> int:
+    assert value % 2 != 0
     return value
 
 ordered = odd(positive(number))

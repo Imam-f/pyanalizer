@@ -11,6 +11,9 @@ class TypeReport:
     inferred: str
     observed: list[str] = field(default_factory=list)
     locations: list[int] = field(default_factory=list)
+    mutability: str = "const"
+    sharing: str = "single"
+    shared_with: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -58,6 +61,7 @@ class FunctionReport:
     signature: str
     async_: bool = False
     parameters: dict[str, str] = field(default_factory=dict)
+    parameter_variables: dict[str, TypeReport] = field(default_factory=dict)
     returns: str = "Unknown"
     exceptions: list[str] = field(default_factory=list)
     variables: dict[str, TypeReport] = field(default_factory=dict)
@@ -74,6 +78,15 @@ class ClassReport:
     name: str
     qualified_name: str
     bases: list[str] = field(default_factory=list)
+    # Members declared directly on this class, grouped by how they arise.
+    class_body_attributes: dict[str, TypeReport] = field(default_factory=dict)
+    initializer_attributes: dict[str, TypeReport] = field(default_factory=dict)
+    dynamic_attributes: dict[str, TypeReport] = field(default_factory=dict)
+    # Flattened inherited members, kept separate so their origin is explicit.
+    inherited_class_variables: dict[str, TypeReport] = field(default_factory=dict)
+    inherited_instance_attributes: dict[str, TypeReport] = field(default_factory=dict)
+    inherited_methods: dict[str, str] = field(default_factory=dict)
+    # Complete views: inherited members plus members declared on this class.
     class_variables: dict[str, TypeReport] = field(default_factory=dict)
     instance_attributes: dict[str, TypeReport] = field(default_factory=dict)
     methods: list[FunctionReport] = field(default_factory=list)

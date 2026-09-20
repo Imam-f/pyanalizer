@@ -38,8 +38,14 @@ class _TypeFacts:
     observed: list[str] = field(default_factory=list)
     locations: list[int] = field(default_factory=list)
     declared: str | None = None
+    writes: int = 0
+    mutable: bool = False
 
-    def add(self, type_name: str, lineno: int) -> None:
+    def add(self, type_name: str, lineno: int, *, write: bool = True) -> None:
+        if write:
+            self.writes += 1
+            if self.writes > 1:
+                self.mutable = True
         if type_name not in self.observed:
             self.observed.append(type_name)
         if lineno not in self.locations:
@@ -47,7 +53,12 @@ class _TypeFacts:
 
     def report(self) -> TypeReport:
         inferred = self.declared or union(self.observed)
-        return TypeReport(inferred=inferred, observed=self.observed.copy(), locations=self.locations.copy())
+        return TypeReport(
+            inferred=inferred,
+            observed=self.observed.copy(),
+            locations=self.locations.copy(),
+            mutability="mutable" if self.mutable else "const",
+        )
 
 
 @dataclass
@@ -87,6 +98,7 @@ def analyze_source(source: str, filename: str = "<string>") -> AnalysisReport:
         classes=result.classes,
     )
     engine.apply_exception_effects()
+    engine.annotate_module_variables(report.variables)
     return report
 
 
@@ -182,16 +194,26 @@ class _Analyzer:
             returns = self._annotation_type(node.returns) if node.returns else self._infer_returns(
                 node, result.symbols, owner_class=owner_class
             )
+        captures = self._captures_owned_by(node, qualified)
+        mutated_roots = _scope_mutated_roots(node)
+        for name in mutated_roots:
+            if name in result.variables:
+                result.variables[name].mutability = "mutable"
+        parameter_variables = self._parameter_variable_reports(
+            node, parameters, result.variables, captures, mutated_roots
+        )
+        self._apply_capture_state(result.variables, captures)
         report = FunctionReport(
             name=node.name,
             qualified_name=qualified,
             signature=f"Callable[[{', '.join(parameters.values())}], {returns}]",
             async_=isinstance(node, ast.AsyncFunctionDef),
             parameters=parameters,
+            parameter_variables=parameter_variables,
             returns=returns,
             variables=result.variables,
             dicts=result.dicts,
-            captures=self._captures_owned_by(node, qualified),
+            captures=captures,
             super_calls=super_calls,
             refinements=self._find_refinements(node, result.symbols, owner_class),
             props=result.props,
@@ -214,7 +236,9 @@ class _Analyzer:
         class_dicts: dict[str, DictReport] = {}
         class_symbols = inherited_symbols.copy()
         instance_facts: dict[str, _TypeFacts] = {}
-        methods: list[FunctionReport] = []
+        declared_methods: list[FunctionReport] = []
+        initializer_attributes: dict[str, TypeReport] = {}
+        dynamic_attribute_facts: dict[str, _TypeFacts] = {}
 
         if qualified in self._analyzing_classes:
             return ClassReport(
@@ -225,10 +249,11 @@ class _Analyzer:
         self._analyzing_classes.add(qualified)
 
         # Resolve same-file bases first so their method effects are available to super().
+        base_reports: list[ClassReport] = []
         for base in node.bases:
             base_node = self._class_nodes.get(self._base_name(base))
             if base_node is not None:
-                self.analyze_class(base_node, "", inherited_symbols)
+                base_reports.append(self.analyze_class(base_node, "", inherited_symbols))
 
         for item in node.body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -249,23 +274,93 @@ class _Analyzer:
                 }
                 self._class_method_attributes[(qualified, item.name)] = method_attribute_reports
                 self._class_method_attributes[(node.name, item.name)] = method_attribute_reports
-                methods.append(method)
+                if item.name == "__init__":
+                    initializer_attributes = self._copy_type_reports(method_attribute_reports)
+                else:
+                    self._merge_reports(dynamic_attribute_facts, method_attribute_reports)
+                declared_methods.append(method)
                 class_symbols[item.name] = method.signature
             elif not isinstance(item, ast.ClassDef):
                 self._statement(item, class_facts, class_dicts, class_symbols, None)
+
+        class_body_attributes = {name: item.report() for name, item in class_facts.items()}
+        declared_instance_attributes = {name: item.report() for name, item in instance_facts.items()}
+        dynamic_attributes = {name: item.report() for name, item in dynamic_attribute_facts.items()}
+        inherited_class_variables = self._flatten_inherited_attributes(base_reports, "class_variables")
+        inherited_instance_attributes = self._flatten_inherited_attributes(base_reports, "instance_attributes")
+        declared_method_names = {method.name for method in declared_methods}
+        inherited_methods = {
+            qualified_name: signature
+            for qualified_name, signature in self._flatten_inherited_methods(base_reports).items()
+            if qualified_name.rsplit(".", 1)[-1] not in declared_method_names
+        }
+        class_variables = self._copy_type_reports(inherited_class_variables)
+        class_variables.update(self._copy_type_reports(class_body_attributes))
+        instance_attributes = self._copy_type_reports(inherited_instance_attributes)
+        instance_attributes.update(self._copy_type_reports(declared_instance_attributes))
+        methods_by_name: dict[str, FunctionReport] = {}
+        for base in base_reports:
+            for method in base.methods:
+                methods_by_name.setdefault(method.name, method)
+        for method in declared_methods:
+            methods_by_name[method.name] = method
 
         report = ClassReport(
             name=node.name,
             qualified_name=qualified,
             bases=[source_name(base) for base in node.bases],
-            class_variables={name: item.report() for name, item in class_facts.items()},
-            instance_attributes={name: item.report() for name, item in instance_facts.items()},
-            methods=methods,
+            class_body_attributes=class_body_attributes,
+            initializer_attributes=initializer_attributes,
+            dynamic_attributes=dynamic_attributes,
+            inherited_class_variables=inherited_class_variables,
+            inherited_instance_attributes=inherited_instance_attributes,
+            inherited_methods=inherited_methods,
+            class_variables=class_variables,
+            instance_attributes=instance_attributes,
+            methods=list(methods_by_name.values()),
         )
+        self._annotate_class_variable_sharing(node, qualified, report)
         self._class_reports[qualified] = report
         self._class_reports.setdefault(node.name, report)
         self._analyzing_classes.discard(qualified)
         return report
+
+    @staticmethod
+    def _copy_type_reports(source: dict[str, TypeReport]) -> dict[str, TypeReport]:
+        return {
+            name: TypeReport(
+                inferred=value.inferred,
+                observed=value.observed.copy(),
+                locations=value.locations.copy(),
+                mutability=value.mutability,
+                sharing=value.sharing,
+                shared_with=value.shared_with.copy(),
+            )
+            for name, value in source.items()
+        }
+
+    def _flatten_inherited_attributes(
+        self,
+        base_reports: list[ClassReport],
+        attribute: str,
+    ) -> dict[str, TypeReport]:
+        flattened: dict[str, TypeReport] = {}
+        for base in base_reports:
+            for name, value in getattr(base, attribute).items():
+                flattened.setdefault(name, self._copy_type_reports({name: value})[name])
+        return flattened
+
+    @staticmethod
+    def _flatten_inherited_methods(base_reports: list[ClassReport]) -> dict[str, str]:
+        flattened: dict[str, str] = {}
+        seen_names: set[str] = set()
+        for base in base_reports:
+            for method in base.methods:
+                if method.name in seen_names:
+                    continue
+                seen_names.add(method.name)
+                flattened[method.qualified_name] = method.signature
+        return flattened
 
     def _statement(
         self,
@@ -276,10 +371,12 @@ class _Analyzer:
         instance_attributes: dict[str, _TypeFacts] | None,
     ) -> None:
         inferer = ExpressionInferer(symbols, self._props)
+        self._mark_direct_mutations(node, facts, instance_attributes)
         if isinstance(node, ast.Assign):
             inferred = inferer.infer(node.value)
             for target in node.targets:
                 self._assign_target(target, inferred, node.lineno, facts, symbols, instance_attributes)
+                self._mark_target_mutated(target, facts, instance_attributes)
                 self._record_dict(target, node.value, dicts, inferer)
             return
         if isinstance(node, ast.AnnAssign):
@@ -289,6 +386,7 @@ class _Analyzer:
                 node.target, inferred, node.lineno, facts, symbols, instance_attributes,
                 declared=annotation,
             )
+            self._mark_target_mutated(node.target, facts, instance_attributes)
             if node.value:
                 self._record_dict(node.target, node.value, dicts, inferer)
             return
@@ -296,6 +394,7 @@ class _Analyzer:
             previous = inferer.infer(node.target)
             inferred = ExpressionInferer(symbols, self._props).infer(ast.BinOp(node.target, node.op, node.value))
             self._assign_target(node.target, inferred or previous, node.lineno, facts, symbols, instance_attributes)
+            self._mark_target_mutated(node.target, facts, instance_attributes)
             return
         if isinstance(node, (ast.For, ast.AsyncFor)):
             iterable = inferer.infer(node.iter)
@@ -336,6 +435,46 @@ class _Analyzer:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.stmt) and not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 self._statement(child, facts, dicts, symbols, instance_attributes)
+
+    def _mark_direct_mutations(
+        self,
+        node: ast.stmt,
+        facts: dict[str, _TypeFacts],
+        instance_attributes: dict[str, _TypeFacts] | None,
+    ) -> None:
+        for item in _direct_effect_nodes(node):
+            if (
+                isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr in MUTATING_METHODS
+            ):
+                root = _mutation_root(item.func.value)
+                if root in facts:
+                    facts[root].mutable = True
+                attribute = _instance_attribute_root(item.func.value)
+                if instance_attributes is not None and attribute is not None:
+                    instance_attributes.setdefault(attribute, _TypeFacts()).mutable = True
+
+    @staticmethod
+    def _mark_target_mutated(
+        target: ast.AST,
+        facts: dict[str, _TypeFacts],
+        instance_attributes: dict[str, _TypeFacts] | None,
+    ) -> None:
+        if isinstance(target, ast.Name):
+            return
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in {"self", "cls"}
+        ):
+            return
+        root = _mutation_root(target)
+        if root in facts:
+            facts[root].mutable = True
+        attribute = _instance_attribute_root(target)
+        if instance_attributes is not None and attribute is not None:
+            instance_attributes.setdefault(attribute, _TypeFacts()).mutable = True
 
     def _assign_target(
         self,
@@ -524,6 +663,7 @@ class _Analyzer:
             return None
         parameter = positional[0]
         parameter_type = source_name(parameter.annotation).strip("'\"") if parameter.annotation else "Unknown"
+        predicate = self._guarantee_predicate(node)
         qualified = f"{prefix}.{node.name}" if prefix else node.name
         report = PropReport(
             name=node.name,
@@ -531,7 +671,7 @@ class _Analyzer:
             parameter=parameter.arg,
             parameter_type=parameter_type,
             returns=parameter_type,
-            predicate=None,
+            predicate=predicate,
             constructed_type=f"Refined[{parameter_type}, {node.name}]",
             line=node.lineno,
         )
@@ -545,6 +685,17 @@ class _Analyzer:
             source_name(decorator).rsplit(".", 1)[-1] in {"guarantee", "prop"}
             for decorator in node.decorator_list
         )
+
+    @staticmethod
+    def _guarantee_predicate(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+        assertions = [item for item in _walk_without_nested(node) if isinstance(item, ast.Assert)]
+        if len(assertions) == 1:
+            return source_name(assertions[0].test)
+        returns = [item for item in _walk_without_nested(node) if isinstance(item, ast.Return)]
+        annotation = source_name(node.returns).strip("'\"") if node.returns else "Unknown"
+        if annotation == "bool" and len(returns) == 1 and returns[0].value is not None:
+            return source_name(returns[0].value)
+        return None
 
     def _find_refinements(
         self,
@@ -591,11 +742,6 @@ class _Analyzer:
         for _ in range(max(1, len(effects) + 1)):
             updated: dict[str, set[str]] = {}
             for name, node in self._function_nodes.items():
-                if self._is_prop(node):
-                    # Guarantee bodies declare facts; the runtime identity
-                    # wrapper does not execute their statements.
-                    updated[name] = set()
-                    continue
                 updated[name] = self._exceptions_in_statements(
                     node.body,
                     effects,
@@ -647,6 +793,7 @@ class _Analyzer:
 
             for effect_node in _direct_effect_nodes(statement):
                 if isinstance(effect_node, ast.Call):
+                    result.update(self._join_exception_effects(effect_node, effects))
                     callee = self._resolve_call(effect_node, caller, owner_class)
                     if callee is not None:
                         result.update(effects.get(callee, set()))
@@ -661,6 +808,24 @@ class _Analyzer:
                         reraised=reraised,
                     )
                 )
+        return result
+
+    def _join_exception_effects(
+        self,
+        call: ast.Call,
+        effects: dict[str, set[str]],
+    ) -> set[str]:
+        if source_name(call.func).rsplit(".", 1)[-1] != "join" or len(call.args) < 2:
+            return set()
+        guarantees = call.args[1]
+        if not isinstance(guarantees, (ast.Tuple, ast.List, ast.Set)):
+            return set()
+        result: set[str] = set()
+        for item in guarantees.elts:
+            name = source_name(item)
+            prop = self._props.get(name) or self._props.get(name.rsplit(".", 1)[-1])
+            if prop is not None:
+                result.update(effects.get(prop.qualified_name, set()))
         return result
 
     def _exceptions_in_try(
@@ -832,6 +997,106 @@ class _Analyzer:
         return f"{base} raises {' | '.join(exceptions)}" if exceptions else base
 
     @staticmethod
+    def _parameter_variable_reports(
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        parameters: dict[str, str],
+        local_variables: dict[str, TypeReport],
+        captures: list[CaptureReport],
+        mutated_roots: set[str],
+    ) -> dict[str, TypeReport]:
+        argument_lines = {
+            argument.arg: argument.lineno
+            for argument in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+        }
+        if node.args.vararg:
+            argument_lines[node.args.vararg.arg] = node.args.vararg.lineno
+        if node.args.kwarg:
+            argument_lines[node.args.kwarg.arg] = node.args.kwarg.lineno
+        capture_map = {capture.name: capture for capture in captures}
+        reports: dict[str, TypeReport] = {}
+        for displayed_name, type_name in parameters.items():
+            name = displayed_name.lstrip("*")
+            capture = capture_map.get(name)
+            reports[displayed_name] = TypeReport(
+                inferred=type_name,
+                observed=[type_name],
+                locations=[argument_lines.get(name, node.lineno)],
+                mutability="mutable" if name in local_variables or name in mutated_roots else "const",
+                sharing=capture.kind if capture else "single",
+                shared_with=capture.captured_by.copy() if capture else [],
+            )
+            if capture and capture.mutable:
+                reports[displayed_name].mutability = "mutable"
+        return reports
+
+    @staticmethod
+    def _apply_capture_state(
+        variables: dict[str, TypeReport],
+        captures: list[CaptureReport],
+    ) -> None:
+        for capture in captures:
+            variable = variables.get(capture.name)
+            if variable is None:
+                continue
+            variable.sharing = capture.kind
+            variable.shared_with = capture.captured_by.copy()
+            if capture.mutable:
+                variable.mutability = "mutable"
+
+    def annotate_module_variables(self, variables: dict[str, TypeReport]) -> None:
+        """Attach cross-function sharing and mutation to module bindings."""
+        users: dict[str, set[str]] = {name: set() for name in variables}
+        mutators: set[str] = set()
+        for qualified, node in self._function_nodes.items():
+            local_names = _function_locals(node)
+            loads, mutations = _function_usage(node)
+            for name in variables:
+                if name in local_names:
+                    continue
+                if name in loads or name in mutations:
+                    users[name].add(qualified)
+                if name in mutations:
+                    mutators.add(name)
+        for name, variable in variables.items():
+            shared_with = sorted(users[name])
+            variable.shared_with = shared_with
+            variable.sharing = "shared" if len(shared_with) > 1 else "single"
+            if name in mutators:
+                variable.mutability = "mutable"
+
+    @staticmethod
+    def _annotate_class_variable_sharing(
+        node: ast.ClassDef,
+        qualified: str,
+        report: ClassReport,
+    ) -> None:
+        instance_users: dict[str, set[str]] = {
+            name: set(variable.shared_with)
+            for name, variable in report.instance_attributes.items()
+        }
+        class_users: dict[str, set[str]] = {
+            name: set(variable.shared_with)
+            for name, variable in report.class_variables.items()
+        }
+        for item in node.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            method_name = f"{qualified}.{item.name}"
+            for visited in _walk_without_nested(item):
+                if not isinstance(visited, ast.Attribute) or not isinstance(visited.value, ast.Name):
+                    continue
+                if visited.value.id == "self" and visited.attr in instance_users:
+                    instance_users[visited.attr].add(method_name)
+                if visited.value.id in {"self", "cls", node.name} and visited.attr in class_users:
+                    class_users[visited.attr].add(method_name)
+        for name, variable in report.instance_attributes.items():
+            variable.shared_with = sorted(instance_users[name])
+            variable.sharing = "shared" if len(variable.shared_with) > 1 else "single"
+        for name, variable in report.class_variables.items():
+            variable.shared_with = sorted(class_users[name])
+            variable.sharing = "shared" if len(variable.shared_with) > 1 else "single"
+
+    @staticmethod
     def _base_name(base: ast.AST) -> str:
         name = source_name(base)
         return name.split("[", 1)[0].rsplit(".", 1)[-1]
@@ -841,17 +1106,26 @@ class _Analyzer:
         for name, incoming in source.items():
             current = target.setdefault(name, _TypeFacts())
             current.declared = current.declared or incoming.declared
+            current.writes += incoming.writes
+            current.mutable = current.mutable or incoming.mutable or current.writes > 1
             for observed in incoming.observed:
                 for line in incoming.locations or [0]:
-                    current.add(observed, line)
+                    current.add(observed, line, write=False)
 
     @staticmethod
     def _merge_reports(target: dict[str, _TypeFacts], source: dict[str, TypeReport]) -> None:
         for name, incoming in source.items():
             current = target.setdefault(name, _TypeFacts())
+            incoming_writes = max(1, len(incoming.locations))
+            current.writes += incoming_writes
+            current.mutable = (
+                current.mutable
+                or incoming.mutability == "mutable"
+                or current.writes > 1
+            )
             for observed in incoming.observed or [incoming.inferred]:
                 for line in incoming.locations or [0]:
-                    current.add(observed, line)
+                    current.add(observed, line, write=False)
 
     def _captures_owned_by(
         self,
@@ -970,6 +1244,52 @@ def _mutation_root(node: ast.AST) -> str | None:
     while isinstance(node, (ast.Subscript, ast.Attribute)):
         node = node.value
     return node.id if isinstance(node, ast.Name) else None
+
+
+def _instance_attribute_root(node: ast.AST) -> str | None:
+    """Return the first ``self``/``cls`` attribute owning a mutation target."""
+    current = node
+    while isinstance(current, ast.Subscript):
+        current = current.value
+    while isinstance(current, ast.Attribute):
+        if isinstance(current.value, ast.Name) and current.value.id in {"self", "cls"}:
+            return current.attr
+        current = current.value
+        while isinstance(current, ast.Subscript):
+            current = current.value
+    return None
+
+
+def _scope_mutated_roots(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Find bindings whose values or binding slots are mutated in this scope."""
+    mutations: set[str] = set()
+    for item in _walk_without_nested(node):
+        if isinstance(item, ast.AugAssign):
+            root = _mutation_root(item.target)
+            if root:
+                mutations.add(root)
+        elif isinstance(item, (ast.Assign, ast.AnnAssign)):
+            targets = item.targets if isinstance(item, ast.Assign) else [item.target]
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    continue
+                root = _mutation_root(target)
+                if root:
+                    mutations.add(root)
+        elif isinstance(item, ast.Delete):
+            for target in item.targets:
+                root = _mutation_root(target)
+                if root:
+                    mutations.add(root)
+        elif (
+            isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr in MUTATING_METHODS
+        ):
+            root = _mutation_root(item.func.value)
+            if root:
+                mutations.add(root)
+    return mutations
 
 
 def _super_method_name(node: ast.AST | None) -> str | None:
