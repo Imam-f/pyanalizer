@@ -1,6 +1,6 @@
 # pyanalyzer
 
-`pyanalyzer` is a small, dependency-free static analyzer for Python source. It
+`pyanalyzer` is a small, dependency-free static analyzer for Python and Cython source. It
 uses the standard-library AST and **does not import or execute the file being
 inspected**.
 
@@ -36,6 +36,8 @@ uv run pyanalyzer --json examples/demo.py
 uv run pyanalyzer-gui examples/demo.py
 # Equivalent module form:
 uv run python -m pyanalyzer examples/demo.py
+# Analyze Cython source without installing Cython or a C compiler:
+uv run pyanalyzer examples/demo.pyx
 ```
 
 Analyze several files at once by passing multiple paths. The JSON form returns
@@ -66,6 +68,89 @@ from pyanalyzer import analyze_file, analyze_source
 
 report = analyze_file("example.py")
 print(report.to_dict())
+```
+
+## Cython source
+
+Files ending in `.pyx`, `.pxd`, or `.pxi` automatically use the Cython reader.
+The CLI and GUI accept these files, and the GUI highlights Cython keywords.
+Use `--language cython` to analyze files with another extension, or select it
+explicitly for source snippets:
+
+```python
+report = analyze_source("cdef double value = 1.5", language="cython")
+assert report.variables["value"].inferred == "double"
+```
+
+The reader supports `cdef` variables and declaration blocks, typed parameters
+on `def`/`cdef`/`cpdef` functions, function prototypes, `cdef class` instance
+fields and methods, `cimport`, simple `ctypedef` aliases, `cdef extern from`
+blocks, and `with gil`/`with nogil` blocks. It preserves C type names, pointer
+and array declarations, typed memoryviews, and source line numbers. Memoryview
+indexing reports element types; partial indexing and slicing report remaining
+dimensions. Function qualifiers such as `inline`, `noexcept`, and `except? -1`
+are accepted; exception reports still describe explicit Python raises and
+same-file propagation. See the [Cython language reference](https://docs.cython.org/en/latest/src/userguide/language_basics.html)
+for the declaration syntax.
+
+This is a structural reader for a subset of Cython, not a Cython compiler or
+C type checker. It does not expand includes,
+validate C arithmetic conversions, or model GIL and ABI behavior. C/C++
+structs, unions, enums, fused types, function pointers, and casts produce
+diagnostics. Other expressions use the analyzer's conservative Python
+inference, with unresolved operations reported as `Unknown`. Analyze included `.pxi` files
+directly. Ordinary Python annotations in Cython's pure Python mode remain
+available through the Python reader; Cython decorator and helper-call semantics
+are not interpreted.
+
+## External dependency stubs
+
+Enable external import inference with `--use-stubs`. The analyzer reads `.pyi`
+and supported `.pxd` declarations without importing dependencies or executing
+their code. The GUI also has a **Use stubs** checkbox.
+
+```console
+# Search beside the source, the nearest project .venv, and the active Python path:
+uv run pyanalyzer --use-stubs app.py
+# Select another virtual environment (Windows and Unix layouts are supported):
+uv run pyanalyzer --venv C:/projects/myapp/.venv app.py
+# Supply custom declarations; repeat --stub-path to add more locations:
+uv run pyanalyzer --stub-path ./stubs --venv .venv app.py
+# A single stub file is accepted, with its filename used as the module name:
+uv run pyanalyzer --stub-path ./stubs/dependency.pyi app.py
+uv run pyanalyzer-gui --use-stubs --venv .venv app.py
+```
+
+`--stub-path` and `--venv` enable stub lookup automatically. Custom stub paths
+take priority, followed by source/package directories and the selected
+environment. If no environment is selected, lookup also searches the nearest
+ancestor's `.venv` and the analyzer's current `sys.path`. Selecting `--venv`
+excludes the analyzer's ambient Python path. Installed stub-only packages such
+as `dependency-stubs` are searched before adjacent `dependency` stubs, and
+`.pyi` declarations are preferred to `.pxd` declarations in each location.
+No dependency installation, environment activation, `.pth` execution, or
+dependency interpreter invocation occurs.
+
+For example, given `stubs/dependency.pyi` containing
+`def read() -> list[str]: ...`, `from dependency import read; result = read()`
+reports `result` as `list[str]` when stub lookup is enabled. Resolution covers
+module aliases, submodules, relative imports in packages, explicit re-exports,
+declared variables, constructors, inherited class members, properties, and
+Cython `cimport` declarations. Overloaded functions conservatively return a
+union of all declared returns; argument matching and generic substitution are
+not implemented. Only declaration files are used; inline annotations in
+dependency `.py` implementations and bundled typeshed are not provided.
+Missing declarations remain `Unknown`, while unreadable or malformed stubs
+appear in report errors. Text output lists loaded stubs, and JSON records
+their paths in `stub_files`.
+
+The same options are available in the Python API:
+
+```python
+report = analyze_file("app.py", use_stubs=True)
+report = analyze_file("app.py", stub_paths=["stubs"], venv=".venv")
+report = analyze_source("from dependency import read\nresult = read()",
+                        stub_paths=["stubs"])
 ```
 
 ## Interpretation and limits
@@ -145,4 +230,4 @@ def require_positive(value: Annotated[int, positive]) -> int:
 Python is highly dynamic, so unresolved calls and attributes are reported as
 `Unknown`. This analyzer is designed for quick structural inspection and
 machine-readable reports; use a full checker such as Pyright or mypy when you
-need import resolution, generics, protocols, and whole-program correctness.
+need complete import resolution, generics, protocols, and whole-program correctness.

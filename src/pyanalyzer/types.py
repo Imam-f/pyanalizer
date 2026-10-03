@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -60,13 +61,50 @@ def promote_literal(type_name: str) -> str:
     return type(parsed).__name__
 
 
+def _type_arguments(value: str) -> list[str]:
+    """Split a type's arguments without splitting nested generics or literals."""
+    parts: list[str] = []
+    depth = 0
+    quote = ""
+    escaped = False
+    start = 0
+    for index, character in enumerate(value):
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+        elif character in {"'", '"'}:
+            quote = character
+        elif character in "[({":
+            depth += 1
+        elif character in "])}":
+            depth -= 1
+        elif character == "," and depth == 0:
+            parts.append(value[start:index].strip())
+            start = index + 1
+    parts.append(value[start:].strip())
+    return parts
+
+
+def callable_return(signature: str) -> str:
+    if not signature.startswith("Callable["):
+        return "Unknown"
+    # Exception effects follow the outer closing bracket, after the type.
+    signature = signature.split(" raises ", 1)[0]
+    arguments = _type_arguments(signature[len("Callable["):-1])
+    return arguments[-1] if len(arguments) == 2 else "Unknown"
+
+
 def union(types: Iterable[str], *, widen_literals: bool = True) -> str:
     values: list[str] = []
     for item in types:
         if widen_literals:
             item = promote_literal(item)
         if item.startswith("Union[") and item.endswith("]"):
-            candidates = [part.strip() for part in item[6:-1].split(",")]
+            candidates = _type_arguments(item[6:-1])
         else:
             candidates = [item]
         for candidate in candidates:
@@ -99,6 +137,8 @@ class ExpressionInferer:
         if isinstance(node, ast.Constant):
             return literal_type(node.value)
         if isinstance(node, ast.Name):
+            if node.id in self.symbols:
+                return self.symbols[node.id]
             if node.id in {"str", "int", "float", "complex", "bool", "bytes", "object", "None"}:
                 return f"type[{node.id}]"
             return self.symbols.get(node.id, "Unknown")
@@ -148,6 +188,15 @@ class ExpressionInferer:
         if isinstance(node, ast.Call):
             return self._call(node)
         if isinstance(node, ast.Attribute):
+            container = self.infer(node.value)
+            alias = self.symbols.get(container, "")
+            if alias.startswith("type["):
+                container = alias[5:-1]
+            if container.startswith(("Module[", "type[")):
+                container = container[container.index("[") + 1:-1]
+            known = self.symbols.get(f"@stub:{container}.{node.attr}")
+            if known:
+                return known
             return "Unknown"
         if isinstance(node, ast.Subscript):
             if source_name(node.value).split(".")[-1] in {
@@ -156,6 +205,20 @@ class ExpressionInferer:
             }:
                 return source_name(node)
             container = self.infer(node.value)
+            memoryview = re.fullmatch(r"(.+)\[([:,0-9]+)\]", container)
+            if memoryview and ":" in memoryview[2]:
+                dimensions = memoryview[2].split(",")
+                indices = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+                if len(indices) > len(dimensions) or any(
+                    isinstance(index, ast.Constant) and index.value is Ellipsis for index in indices
+                ):
+                    return "Unknown"
+                remaining = [":" for index in indices if isinstance(index, ast.Slice)]
+                remaining.extend(dimensions[len(indices):])
+                element = memoryview[1]
+                if remaining:
+                    return f"{element}[{','.join(remaining)}]"
+                return element.removeprefix("const ")
             if container.startswith("list[") or container.startswith("set["):
                 return container[container.find("[") + 1 : -1]
             return "Unknown"
@@ -178,10 +241,11 @@ class ExpressionInferer:
 
     def _call(self, node: ast.Call) -> str:
         name = source_name(node.func)
+        known = self.infer(node.func)
         prop = self.props.get(name) or self.props.get(name.rsplit(".", 1)[-1])
         if prop is not None and node.args:
             return f"Refined[{self.infer(node.args[0])}, {prop.name}]"
-        if name.rsplit(".", 1)[-1] == "join" and node.args:
+        if name.rsplit(".", 1)[-1] == "join" and node.args and not known.startswith("Callable["):
             guarantees = self._join_guarantees(node.args[1]) if len(node.args) > 1 else []
             value = self.infer(node.args[0])
             if guarantees:
@@ -194,13 +258,12 @@ class ExpressionInferer:
             "len": "int", "sum": "Unknown", "min": "Unknown", "max": "Unknown",
             "sorted": "list[Unknown]", "range": "range", "enumerate": "enumerate",
         }
-        if name in constructors:
-            return constructors[name]
-        known = self.symbols.get(name)
         if known and known.startswith("type["):
-            return name
+            return known[5:-1]
         if known and known.startswith("Callable["):
-            return known.rsplit(", ", 1)[-1].rstrip("]")
+            return callable_return(known)
+        if name in constructors and name not in self.symbols:
+            return constructors[name]
         return "Unknown"
 
     def _join_guarantees(self, node: ast.AST) -> list[str]:

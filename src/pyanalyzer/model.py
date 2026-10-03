@@ -101,6 +101,7 @@ class AnalysisReport:
     functions: list[FunctionReport] = field(default_factory=list)
     classes: list[ClassReport] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    stub_files: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

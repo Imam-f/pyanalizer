@@ -14,6 +14,8 @@ from tkinter import END, TclError, Tk, filedialog, messagebox, ttk
 import tkinter as tk
 
 from .analyzer import analyze_source
+from .cython import CYTHON_KEYWORDS
+from .stubs import StubResolver, add_stub_options
 from .model import (
     AnalysisReport,
     CaptureReport,
@@ -225,9 +227,15 @@ class AnalyzerGUI:
 
     _TOKEN_TAGS = ("keyword", "builtin", "string", "comment", "number", "operator", "definition")
 
-    def __init__(self, root: Tk, path: Path | None = None) -> None:
+    def __init__(
+        self, root: Tk, path: Path | None = None, *, use_stubs: bool = False,
+        stub_paths: list[Path] | tuple[Path, ...] = (), venv: Path | None = None,
+    ) -> None:
         self.root = root
         self.path = path
+        self.stub_enabled = tk.BooleanVar(root, value=bool(use_stubs or stub_paths or venv is not None))
+        self.stub_paths = tuple(stub_paths)
+        self.venv = venv
         self._after_id: str | None = None
         self._hovered_item = ""
         self._hovered_code_name = ""
@@ -271,6 +279,9 @@ class AnalyzerGUI:
         ttk.Button(toolbar, text="Open", command=self.open_file).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar, text="Save", command=self.save_file).pack(side="left", padx=(0, 6))
         ttk.Button(toolbar, text="Analyze", command=self.analyze).pack(side="left")
+        ttk.Checkbutton(
+            toolbar, text="Use stubs", variable=self.stub_enabled, command=self.analyze,
+        ).pack(side="left", padx=8)
         self.file_label = ttk.Label(toolbar, text="Untitled", style="Status.TLabel")
         self.file_label.pack(side="left", padx=12)
 
@@ -419,8 +430,8 @@ class AnalyzerGUI:
 
     def open_file(self) -> None:
         selected = filedialog.askopenfilename(
-            title="Open Python file",
-            filetypes=(("Python files", "*.py"), ("All files", "*.*")),
+            title="Open Python or Cython file",
+            filetypes=(("Python and Cython files", "*.py *.pyi *.pyx *.pxd *.pxi"), ("All files", "*.*")),
         )
         if selected:
             self.open_path(Path(selected))
@@ -439,9 +450,9 @@ class AnalyzerGUI:
     def save_file(self) -> None:
         if self.path is None:
             selected = filedialog.asksaveasfilename(
-                title="Save Python file",
+                title="Save Python or Cython file",
                 defaultextension=".py",
-                filetypes=(("Python files", "*.py"), ("All files", "*.*")),
+                filetypes=(("Python and Cython files", "*.py *.pyi *.pyx *.pxd *.pxi"), ("All files", "*.*")),
             )
             if not selected:
                 return
@@ -460,7 +471,11 @@ class AnalyzerGUI:
         source = self.editor.get("1.0", "end-1c")
         self._highlight_source(source)
         filename = str(self.path) if self.path else "<editor>"
-        report = analyze_source(source, filename=filename)
+        use_stubs = self.stub_enabled.get()
+        report = analyze_source(
+            source, filename=filename, use_stubs=use_stubs,
+            stub_paths=self.stub_paths if use_stubs else (), venv=self.venv if use_stubs else None,
+        )
         self._populate_symbols(report)
         if report.errors:
             self.status.configure(text=report.errors[0])
@@ -480,6 +495,7 @@ class AnalyzerGUI:
         self.editor.tag_remove("symbol_focus", "1.0", END)
         self._name_ranges.clear()
         previous_keyword = ""
+        cython_definition = False
         try:
             tokens = tokenize.generate_tokens(io.StringIO(source).readline)
             for item in tokens:
@@ -488,13 +504,18 @@ class AnalyzerGUI:
                 tag_name = ""
                 if item.type == token.NAME:
                     self._name_ranges.setdefault(item.string, []).append((start, end))
-                    if previous_keyword in {"def", "class"}:
+                    if previous_keyword in {"def", "class"} or (
+                        cython_definition and item.line[item.end[1]:].lstrip().startswith("(")
+                    ):
                         tag_name = "definition"
-                    elif keyword.iskeyword(item.string):
+                        cython_definition = False
+                    elif keyword.iskeyword(item.string) or item.string in CYTHON_KEYWORDS:
                         tag_name = "keyword"
                     elif item.string in dir(builtins):
                         tag_name = "builtin"
-                    previous_keyword = item.string if keyword.iskeyword(item.string) else ""
+                    previous_keyword = item.string if keyword.iskeyword(item.string) or item.string in CYTHON_KEYWORDS else ""
+                    if item.string in {"cdef", "cpdef"}:
+                        cython_definition = True
                 elif item.type == token.STRING:
                     tag_name = "string"
                 elif item.type == token.COMMENT:
@@ -503,10 +524,14 @@ class AnalyzerGUI:
                     tag_name = "number"
                 elif item.type == token.OP:
                     tag_name = "operator"
+                    if item.string in {"=", ":"}:
+                        cython_definition = False
                 elif item.type not in {tokenize.NL, token.NEWLINE, token.INDENT, token.DEDENT}:
                     previous_keyword = ""
                 if tag_name:
                     self.editor.tag_add(tag_name, start, end)
+                if item.type == token.NEWLINE:
+                    cython_definition = False
         except (IndentationError, tokenize.TokenError):
             pass
 
@@ -603,7 +628,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pyanalyzer-gui",
         description="Open the syntax-highlighted pyanalyzer symbol inspector.",
     )
-    parser.add_argument("path", nargs="?", type=Path, help="Python file to open")
+    parser.add_argument("path", nargs="?", type=Path, help="Python or Cython file to open")
+    add_stub_options(parser)
     return parser
 
 
@@ -611,12 +637,17 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.path is not None and not args.path.is_file():
         build_parser().error(f"file not found: {args.path}")
+    if args.use_stubs or args.stub_path or args.venv is not None:
+        try:
+            StubResolver(str(args.path) if args.path else "<editor>", stub_paths=args.stub_path, venv=args.venv)
+        except ValueError as exc:
+            build_parser().error(str(exc))
     try:
         root = Tk()
     except TclError as exc:
         print(f"pyanalyzer-gui: unable to start Tk: {exc}")
         return 1
-    AnalyzerGUI(root, args.path)
+    AnalyzerGUI(root, args.path, use_stubs=args.use_stubs, stub_paths=args.stub_path, venv=args.venv)
     root.mainloop()
     return 0
 

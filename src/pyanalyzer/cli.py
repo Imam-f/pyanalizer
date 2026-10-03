@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from .stubs import add_stub_options
 
 from .analyzer import analyze_file
 from .model import AnalysisReport, FunctionReport, PropReport, TypeReport
@@ -56,10 +57,12 @@ class _Palette:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pyanalyzer",
-        description="Statically inspect Python types, dict shapes, callables, and closure captures.",
+        description="Statically inspect Python and Cython types, dict shapes, callables, and closure captures.",
     )
-    parser.add_argument("paths", nargs="+", type=Path, help="Python files to analyze")
+    parser.add_argument("paths", nargs="+", type=Path, help="Python or Cython files to analyze")
+    parser.add_argument("--language", choices=("python", "cython"), help="override language detection by file extension")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    add_stub_options(parser)
     parser.add_argument(
         "--color",
         choices=("auto", "always", "never"),
@@ -78,7 +81,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"pyanalyzer: file not found: {path}", file=sys.stderr)
             failed = True
             continue
-        report = analyze_file(path)
+        try:
+            report = analyze_file(
+                path, language=args.language, use_stubs=args.use_stubs,
+                stub_paths=args.stub_path, venv=args.venv,
+            )
+        except ValueError as exc:
+            build_parser().error(str(exc))
         reports.append(report)
         failed |= bool(report.errors)
 
@@ -221,6 +230,11 @@ def _render(report: AnalysisReport, *, color: bool = False) -> str:
         block = [colors.heading("variables")]
         block.extend(_type_line(name, value, colors) for name, value in report.variables.items())
         blocks.append(block)
+
+    if report.stub_files:
+        blocks.append([colors.heading("stubs"), *[
+            f"  {colors.name(module)}: {colors.detail(path)}" for module, path in report.stub_files.items()
+        ]])
 
     if report.dicts:
         block = [colors.heading("dictionaries")]

@@ -1,8 +1,8 @@
 """AST-based analysis engine.
 
 The analyzer deliberately stays local and conservative: it never imports or executes
-the file being inspected.  Its report is evidence, not a replacement for a full
-type checker.
+the file being inspected. Optional stub lookup only reads declaration files. Its
+report is evidence, not a replacement for a full type checker.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+from .cython import CYTHON_SUFFIXES, parse_cython
 from .model import (
     AnalysisReport,
     CaptureReport,
@@ -24,6 +25,7 @@ from .model import (
     TypeReport,
 )
 from .types import ExpressionInferer, promote_literal, source_name, union
+from .stubs import StubResolver
 
 
 MUTATING_METHODS = {
@@ -71,23 +73,48 @@ class _ScopeResult:
     symbols: dict[str, str]
 
 
-def analyze_file(path: str | Path) -> AnalysisReport:
+def analyze_file(
+    path: str | Path, *, language: str | None = None, use_stubs: bool = False,
+    stub_paths: Iterable[str | Path] = (), venv: str | Path | None = None,
+) -> AnalysisReport:
     file_path = Path(path)
     try:
         source = file_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         source = file_path.read_text()
-    return analyze_source(source, filename=str(file_path))
+    return analyze_source(
+        source, filename=str(file_path), language=language,
+        use_stubs=use_stubs, stub_paths=stub_paths, venv=venv,
+    )
 
 
-def analyze_source(source: str, filename: str = "<string>") -> AnalysisReport:
+def analyze_source(
+    source: str, filename: str = "<string>", *, language: str | None = None,
+    use_stubs: bool = False, stub_paths: Iterable[str | Path] = (), venv: str | Path | None = None,
+) -> AnalysisReport:
+    """Inspect source without executing it; select Cython by suffix or language.
+
+    Use ``language="cython"`` for snippets without a .pyx/.pxd/.pxi filename.
+    ``language="python"`` forces the ordinary Python parser.
+    ``use_stubs=True`` enables external declarations; ``stub_paths`` and
+    ``venv`` enable lookup as well and select custom stubs or an environment.
+    """
+    if language not in {None, "python", "cython"}:
+        raise ValueError(f"Unsupported source language: {language}")
+    cython = language == "cython" or (
+        language is None and Path(filename).suffix.lower() in CYTHON_SUFFIXES
+    )
     try:
-        tree = ast.parse(source, filename=filename, type_comments=True)
+        tree = parse_cython(source, filename) if cython else ast.parse(
+            source, filename=filename, type_comments=True,
+        )
     except SyntaxError as exc:
         location = f"{filename}:{exc.lineno}:{exc.offset}"
         return AnalysisReport(filename=filename, errors=[f"{location}: {exc.msg}"])
 
-    engine = _Analyzer(filename)
+    stub_paths = tuple(stub_paths)
+    resolver = StubResolver(filename, stub_paths=stub_paths, venv=venv) if use_stubs or stub_paths or venv is not None else None
+    engine = _Analyzer(filename, resolver)
     result = engine.analyze_scope(tree.body, "", {})
     report = AnalysisReport(
         filename=filename,
@@ -96,6 +123,8 @@ def analyze_source(source: str, filename: str = "<string>") -> AnalysisReport:
         props=result.props,
         functions=result.functions,
         classes=result.classes,
+        stub_files=resolver.files.copy() if resolver else {},
+        errors=resolver.errors.copy() if resolver else [],
     )
     engine.apply_exception_effects()
     engine.annotate_module_variables(report.variables)
@@ -103,8 +132,9 @@ def analyze_source(source: str, filename: str = "<string>") -> AnalysisReport:
 
 
 class _Analyzer:
-    def __init__(self, filename: str) -> None:
+    def __init__(self, filename: str, stubs: StubResolver | None = None) -> None:
         self.filename = filename
+        self.stubs = stubs
         self._class_nodes: dict[str, ast.ClassDef] = {}
         self._class_reports: dict[str, ClassReport] = {}
         self._class_method_attributes: dict[tuple[str, str], dict[str, TypeReport]] = {}
@@ -281,7 +311,22 @@ class _Analyzer:
                 declared_methods.append(method)
                 class_symbols[item.name] = method.signature
             elif not isinstance(item, ast.ClassDef):
-                self._statement(item, class_facts, class_dicts, class_symbols, None)
+                if (
+                    getattr(node, "cython_extension", False)
+                    and isinstance(item, ast.AnnAssign)
+                    and getattr(item, "cython_declaration", False)
+                    and isinstance(item.target, ast.Name)
+                ):
+                    # Cython class declarations allocate per-instance C fields.
+                    target = ast.Attribute(value=ast.Name(id="self"), attr=item.target.id)
+                    declared = self._annotation_type(item.annotation)
+                    inferred = ExpressionInferer(class_symbols).infer(item.value) if item.value else declared
+                    self._assign_target(
+                        target, inferred, item.lineno, {}, class_symbols, instance_facts,
+                        declared=declared,
+                    )
+                else:
+                    self._statement(item, class_facts, class_dicts, class_symbols, None)
 
         class_body_attributes = {name: item.report() for name, item in class_facts.items()}
         declared_instance_attributes = {name: item.report() for name, item in instance_facts.items()}
@@ -371,6 +416,12 @@ class _Analyzer:
         instance_attributes: dict[str, _TypeFacts] | None,
     ) -> None:
         inferer = ExpressionInferer(symbols, self._props)
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and self.stubs is not None:
+            bindings = self.stubs.bind_import(node)
+            symbols.update({f"@stub:{name}": value for name, value in self.stubs.symbols.items()})
+            for name, value in bindings.items():
+                self._assign_target(ast.Name(id=name), value, node.lineno, facts, symbols, instance_attributes)
+            return
         self._mark_direct_mutations(node, facts, instance_attributes)
         if isinstance(node, ast.Assign):
             inferred = inferer.infer(node.value)
@@ -1210,6 +1261,11 @@ def _function_locals(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
             names.add(item.name)
         elif isinstance(item, ast.NamedExpr):
             names.update(_target_names(item.target))
+        elif isinstance(item, (ast.Import, ast.ImportFrom)):
+            names.update(
+                alias.asname or (alias.name.split(".")[0] if isinstance(item, ast.Import) else alias.name)
+                for alias in item.names if alias.name != "*"
+            )
     return names - globals_ - nonlocals
 
 

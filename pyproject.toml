@@ -1,7 +1,7 @@
 [project]
 name = "pyanalyzer"
 version = "0.1.0"
-description = "A small, explainable static type and closure analyzer for Python source"
+description = "A small, explainable static type and closure analyzer for Python and Cython source"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
