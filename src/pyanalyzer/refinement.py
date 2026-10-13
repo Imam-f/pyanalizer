@@ -1,4 +1,4 @@
-"""Runtime helpers for guarantee-based refinement types."""
+"""Runtime helpers for guarantee-based proof annotations."""
 
 from __future__ import annotations
 
@@ -32,18 +32,18 @@ class Guarantee(Generic[Value]):
 
 
 def guarantee(declaration: Callable[[Value], Any]) -> Guarantee[Value]:
-    """Declare a validating identity function carrying a refinement guarantee.
+    """Declare a validating identity function carrying a proof guarantee.
 
     The declaration body is executed, so it can enforce its condition with an
     ``assert`` before returning the value. The resulting :class:`Guarantee`
     returns its argument unchanged on success; ``pyanalyzer`` attaches the
-    guarantee name to the successful value's type.
+    guarantee name to the successful value's ``Annotated`` proof tuple.
     """
     return Guarantee(declaration)
 
 
 # ``prop`` remains available for existing source files.  Prefer ``guarantee``
-# for new code, which better communicates the validating refinement behavior.
+# for new code, which better communicates the validating proof behavior.
 prop = guarantee
 
 
@@ -52,7 +52,7 @@ def join(value: Value, guarantees: Iterable[Guarantee[Any]]) -> Value:
 
     Every guarantee is checked, and the original value is returned. For example,
     ``join(number, (odd, positive))`` has the same value as ``number`` while
-    the analyzer records an unordered pair of guarantees.
+    the analyzer records both guarantees in one proof tuple.
     """
 
     for check in guarantees:

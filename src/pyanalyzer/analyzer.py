@@ -24,8 +24,15 @@ from .model import (
     RefinementReport,
     TypeReport,
 )
-from .types import ExpressionInferer, promote_literal, source_name, union
 from .stubs import StubResolver
+from .types import (
+    ExpressionInferer,
+    annotated_proof_type,
+    promote_literal,
+    source_name,
+    union,
+    union_members,
+)
 
 
 MUTATING_METHODS = {
@@ -71,6 +78,13 @@ class _ScopeResult:
     functions: list[FunctionReport]
     classes: list[ClassReport]
     symbols: dict[str, str]
+
+
+@dataclass(frozen=True)
+class _TypeNarrower:
+    name: str
+    qualified_name: str
+    narrowed_type: str
 
 
 def analyze_file(
@@ -142,6 +156,7 @@ class _Analyzer:
         self._function_nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
         self._function_owners: dict[str, str | None] = {}
         self._function_reports: dict[str, FunctionReport] = {}
+        self._type_narrowers: dict[str, _TypeNarrower] = {}
         self._analyzing_classes: set[str] = set()
 
     def analyze_scope(
@@ -166,6 +181,7 @@ class _Analyzer:
                 prop = self._register_prop(statement, prefix)
                 if prop is not None:
                     props.append(prop)
+                self._register_type_narrower(statement, prefix)
             elif isinstance(statement, ast.ClassDef):
                 symbols[statement.name] = f"type[{statement.name}]"
                 qualified = f"{prefix}.{statement.name}" if prefix else statement.name
@@ -218,8 +234,11 @@ class _Analyzer:
         )
         super_calls = self._traverse_super_calls(node, owner_class, instance_attributes)
         if self._is_prop(node) and parameters:
-            # A guarantee wraps the declaration in an identity transform.
-            returns = next(iter(parameters.values()))
+            # A guarantee returns its base value together with proof metadata.
+            prop = self._props.get(qualified)
+            returns = prop.constructed_type if prop is not None else annotated_proof_type(
+                next(iter(parameters.values())), [node.name]
+            )
         else:
             returns = self._annotation_type(node.returns) if node.returns else self._infer_returns(
                 node, result.symbols, owner_class=owner_class
@@ -288,6 +307,7 @@ class _Analyzer:
         for item in node.body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 class_symbols[item.name] = self._callable_signature(item, class_symbols)
+                self._register_type_narrower(item, qualified)
         for item in node.body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 method_attributes: dict[str, _TypeFacts] = {}
@@ -462,8 +482,23 @@ class _Analyzer:
                 self._statement(child, facts, dicts, symbols, instance_attributes)
             return
         if isinstance(node, ast.If):
-            for child in [*node.body, *node.orelse]:
-                self._statement(child, facts, dicts, symbols, instance_attributes)
+            true_symbols = symbols.copy()
+            false_symbols = symbols.copy()
+            self._narrow_condition(node.test, true_symbols, condition_is_true=True)
+            self._narrow_condition(node.test, false_symbols, condition_is_true=False)
+            for child in node.body:
+                self._statement(child, facts, dicts, true_symbols, instance_attributes)
+            for child in node.orelse:
+                self._statement(child, facts, dicts, false_symbols, instance_attributes)
+            true_reaches = not _body_terminates(node.body)
+            false_reaches = not node.orelse or not _body_terminates(node.orelse)
+            self._merge_branch_symbols(
+                symbols,
+                true_symbols,
+                false_symbols,
+                true_reaches=true_reaches,
+                false_reaches=false_reaches,
+            )
             return
         if isinstance(node, (ast.While, ast.Try, ast.TryStar)):
             groups: list[ast.stmt] = [*node.body, *node.orelse]
@@ -716,19 +751,43 @@ class _Analyzer:
         parameter_type = source_name(parameter.annotation).strip("'\"") if parameter.annotation else "Unknown"
         predicate = self._guarantee_predicate(node)
         qualified = f"{prefix}.{node.name}" if prefix else node.name
+        constructed_type = annotated_proof_type(parameter_type, [node.name])
         report = PropReport(
             name=node.name,
             qualified_name=qualified,
             parameter=parameter.arg,
             parameter_type=parameter_type,
-            returns=parameter_type,
+            returns=constructed_type,
             predicate=predicate,
-            constructed_type=f"Refined[{parameter_type}, {node.name}]",
+            constructed_type=constructed_type,
             line=node.lineno,
         )
         self._props[qualified] = report
         self._props.setdefault(node.name, report)
         return report
+
+    def _register_type_narrower(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        prefix: str,
+    ) -> None:
+        annotation = node.returns
+        if not isinstance(annotation, ast.Subscript):
+            return
+        if source_name(annotation.value).rsplit(".", 1)[-1] != "TypeIs":
+            return
+        positional = [*node.args.posonlyargs, *node.args.args]
+        if not positional:
+            return
+        narrowed_type = self._annotation_type(annotation.slice)
+        qualified = f"{prefix}.{node.name}" if prefix else node.name
+        narrower = _TypeNarrower(
+            name=node.name,
+            qualified_name=qualified,
+            narrowed_type=narrowed_type,
+        )
+        self._type_narrowers[qualified] = narrower
+        self._type_narrowers.setdefault(node.name, narrower)
 
     @staticmethod
     def _is_prop(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -754,10 +813,140 @@ class _Analyzer:
         symbols: dict[str, str],
         owner_class: str | None,
     ) -> list[RefinementReport]:
-        # Guarantees attach evidence to returned values; unlike the old
-        # predicate API, they do not make boolean branches meaningful.
-        del node, symbols, owner_class
-        return []
+        del owner_class
+        refinements: list[RefinementReport] = []
+        for statement in _walk_without_nested(node):
+            if not isinstance(statement, ast.If):
+                continue
+            for call, narrower, true_state, false_state in _condition_typeis_calls(
+                statement.test, self._type_narrowers
+            ):
+                argument = call.args[0]
+                if not isinstance(argument, ast.Name):
+                    continue
+                original = symbols.get(argument.id, "Unknown")
+                when_true = (
+                    self._narrow_type(original, narrower.narrowed_type, true_state)
+                    if true_state is not None
+                    else None
+                )
+                when_false = (
+                    self._narrow_type(original, narrower.narrowed_type, false_state)
+                    if false_state is not None
+                    else None
+                )
+                refinements.append(
+                    RefinementReport(
+                        variable=argument.id,
+                        checker=narrower.qualified_name,
+                        condition=source_name(statement.test),
+                        line=statement.lineno,
+                        when_true=when_true,
+                        when_false=when_false,
+                    )
+                )
+        return refinements
+
+    def _narrow_condition(
+        self,
+        condition: ast.AST,
+        symbols: dict[str, str],
+        *,
+        condition_is_true: bool,
+    ) -> None:
+        for call, narrower, true_state, false_state in _condition_typeis_calls(
+            condition, self._type_narrowers
+        ):
+            state = true_state if condition_is_true else false_state
+            if state is None or not isinstance(call.args[0], ast.Name):
+                continue
+            variable = call.args[0].id
+            original = symbols.get(variable, "Unknown")
+            symbols[variable] = self._narrow_type(
+                original, narrower.narrowed_type, state
+            )
+
+    @staticmethod
+    def _merge_branch_symbols(
+        symbols: dict[str, str],
+        true_symbols: dict[str, str],
+        false_symbols: dict[str, str],
+        *,
+        true_reaches: bool,
+        false_reaches: bool,
+    ) -> None:
+        branches = [
+            branch
+            for branch, reaches in (
+                (true_symbols, true_reaches),
+                (false_symbols, false_reaches),
+            )
+            if reaches
+        ]
+        if not branches:
+            return
+        for name in set().union(*(branch.keys() for branch in branches)):
+            values = [branch[name] for branch in branches if name in branch]
+            if values:
+                symbols[name] = union(values, widen_literals=False)
+
+    def _narrow_type(self, original: str, target: str, positive: bool) -> str:
+        original_members = union_members(original)
+        target_members = union_members(target)
+        narrowed: list[str] = []
+        for candidate in original_members:
+            overlaps: list[str] = []
+            for expected in target_members:
+                if self._is_subtype(candidate, expected):
+                    overlaps.append(candidate)
+                elif self._is_subtype(expected, candidate):
+                    overlaps.append(expected)
+            if positive:
+                narrowed.extend(overlaps)
+            elif not overlaps or any(
+                self._is_subtype(expected, candidate)
+                and not self._is_subtype(candidate, expected)
+                for expected in target_members
+            ):
+                # A complement such as ``object & ~str`` is not expressible;
+                # retain the wider candidate in that case.
+                narrowed.append(candidate)
+        if not narrowed:
+            return "Never"
+        return union(narrowed, widen_literals=False)
+
+    def _is_subtype(self, candidate: str, expected: str) -> bool:
+        candidate = promote_literal(candidate)
+        expected = promote_literal(expected)
+        if candidate == expected or expected in {"Any", "object", "Unknown"}:
+            return True
+        builtin_bases = {
+            "bool": {"int", "object"},
+            "int": {"object"},
+            "float": {"object"},
+            "complex": {"object"},
+            "str": {"object"},
+            "bytes": {"object"},
+            "None": {"object"},
+        }
+        if expected in builtin_bases.get(candidate, set()):
+            return True
+        node = self._class_nodes.get(candidate)
+        if node is None:
+            return False
+        pending = [self._base_name(base) for base in node.bases]
+        seen: set[str] = set()
+        while pending:
+            base = pending.pop()
+            if base == expected:
+                return True
+            if base in seen:
+                continue
+            seen.add(base)
+            base_node = self._class_nodes.get(base)
+            if base_node is not None:
+                pending.extend(self._base_name(item) for item in base_node.bases)
+        return False
 
     def _annotation_type(self, annotation: ast.AST) -> str:
         rendered = source_name(annotation).strip("'\"")
@@ -770,19 +959,25 @@ class _Analyzer:
                 arguments = annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
                 if not arguments:
                     return rendered
-                guarantees: set[str] = set()
+                guarantees: list[str] = []
                 for metadata in arguments[1:]:
-                    name = source_name(metadata)
-                    guarantee = self._props.get(name) or self._props.get(name.rsplit(".", 1)[-1])
-                    if guarantee is not None:
-                        guarantees.add(guarantee.name)
-                if len(guarantees) == 1:
-                    return f"Refined[{source_name(arguments[0])}, {guarantees.pop()}]"
+                    items = (
+                        metadata.elts
+                        if isinstance(metadata, (ast.Tuple, ast.List, ast.Set))
+                        else [metadata]
+                    )
+                    for item in items:
+                        name = source_name(item)
+                        guarantee = self._props.get(name) or self._props.get(
+                            name.rsplit(".", 1)[-1]
+                        )
+                        if guarantee is not None and guarantee.name not in guarantees:
+                            guarantees.append(guarantee.name)
                 if guarantees:
-                    return f"Refined[{source_name(arguments[0])}, {{{', '.join(sorted(guarantees))}}}]"
+                    return annotated_proof_type(self._annotation_type(arguments[0]), guarantees)
             prop = self._props.get(constructor)
             if prop is not None:
-                return f"Refined[{source_name(annotation.slice)}, {prop.name}]"
+                return annotated_proof_type(self._annotation_type(annotation.slice), [prop.name])
         return rendered
 
     def apply_exception_effects(self) -> None:
@@ -1362,31 +1557,43 @@ def _super_method_name(node: ast.AST | None) -> str | None:
     return None
 
 
-def _condition_prop_calls(
+def _condition_typeis_calls(
     node: ast.AST,
-    props: dict[str, PropReport],
-) -> list[tuple[ast.Call, PropReport, bool | None, bool | None]]:
-    """Find ``@prop`` calls and map condition truth to checker truth.
+    narrowers: dict[str, _TypeNarrower],
+) -> list[tuple[ast.Call, _TypeNarrower, bool | None, bool | None]]:
+    """Find ``TypeIs`` calls and map condition truth to predicate truth.
 
-    Each tuple contains ``(call, prop, state_when_condition_true,
+    Each tuple contains ``(call, narrower, state_when_condition_true,
     state_when_condition_false)``. ``None`` means the compound boolean does not
-    make that checker's state certain on that branch.
+    make that predicate's state certain on that branch.
     """
     if isinstance(node, ast.Call) and node.args:
         name = source_name(node.func)
-        prop = props.get(name) or props.get(name.rsplit(".", 1)[-1])
-        if prop is not None:
-            return [(node, prop, True, False)]
+        narrower = narrowers.get(name) or narrowers.get(name.rsplit(".", 1)[-1])
+        if narrower is not None:
+            return [(node, narrower, True, False)]
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
         return [
-            (call, prop, false_state, true_state)
-            for call, prop, true_state, false_state in _condition_prop_calls(node.operand, props)
+            (call, narrower, false_state, true_state)
+            for call, narrower, true_state, false_state in _condition_typeis_calls(
+                node.operand, narrowers
+            )
         ]
     if isinstance(node, ast.BoolOp):
-        children = [item for value in node.values for item in _condition_prop_calls(value, props)]
+        children = [
+            item
+            for value in node.values
+            for item in _condition_typeis_calls(value, narrowers)
+        ]
         if isinstance(node.op, ast.And):
-            return [(call, prop, true_state, None) for call, prop, true_state, _ in children]
-        return [(call, prop, None, false_state) for call, prop, _, false_state in children]
+            return [
+                (call, narrower, true_state, None)
+                for call, narrower, true_state, _ in children
+            ]
+        return [
+            (call, narrower, None, false_state)
+            for call, narrower, _, false_state in children
+        ]
     if (
         isinstance(node, ast.Compare)
         and len(node.ops) == 1
@@ -1396,14 +1603,29 @@ def _condition_prop_calls(
         and isinstance(node.comparators[0].value, bool)
         and isinstance(node.ops[0], (ast.Eq, ast.Is, ast.NotEq, ast.IsNot))
     ):
-        direct = _condition_prop_calls(node.left, props)
+        direct = _condition_typeis_calls(node.left, narrowers)
         if not direct:
             return []
         expected = node.comparators[0].value
         if isinstance(node.ops[0], (ast.NotEq, ast.IsNot)):
             expected = not expected
-        return [(call, prop, expected, not expected) for call, prop, _, _ in direct]
+        return [
+            (call, narrower, expected, not expected)
+            for call, narrower, _, _ in direct
+        ]
     return []
+
+
+def _body_terminates(body: list[ast.stmt]) -> bool:
+    """Whether a simple branch cannot reach the statement following it."""
+    if not body:
+        return False
+    final = body[-1]
+    if isinstance(final, (ast.Return, ast.Raise)):
+        return True
+    if isinstance(final, ast.If) and final.orelse:
+        return _body_terminates(final.body) and _body_terminates(final.orelse)
+    return False
 
 
 def _direct_effect_nodes(statement: ast.stmt) -> Iterable[ast.AST]:

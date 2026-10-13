@@ -62,22 +62,22 @@ def odd(value: int) -> int:
 
 # Refinement showcase. These appear directly in the analyzer's variables section:
 #
-#   positive_sample -> Refined[int, positive]
-#   ordered_sample  -> Refined[Refined[int, positive], odd]
-#   joined_sample   -> Refined[int, {odd, positive}]
+#   positive_sample -> Annotated[int, (positive,)]
+#   ordered_sample  -> Annotated[int, (positive, odd)]
+#   joined_sample   -> Annotated[int, (positive, odd)]
 sample_number = 7
 positive_sample = positive(sample_number)
 ordered_sample = odd(positive(sample_number))
 joined_sample = join(sample_number, (positive, odd))
 
 
-def positive_result(value: int) -> Annotated[int, positive]:
-    """Return type: Refined[int, positive]."""
+def positive_result(value: int) -> Annotated[int, (positive,)]:
+    """Return type: Annotated[int, (positive,)]."""
     return positive(value)
 
 
-def positive_odd_result(value: int) -> Annotated[int, positive, odd]:
-    """Return type: Refined[int, {odd, positive}]."""
+def positive_odd_result(value: int) -> Annotated[int, (positive, odd)]:
+    """Return type: Annotated[int, (positive, odd)]."""
     return join(value, (positive, odd))
 
 
@@ -107,7 +107,7 @@ def describe(job: NumberJob) -> str:
     # Nested guarantees are ordered: odd is applied after positive.
     ordered = odd(positive(job.value))
 
-    # join expresses the same guarantees as an unordered set.
+    # join records the supplied guarantees in one proof tuple.
     unordered = join(job.value, (odd, positive))
     return f"ordered={ordered}, unordered={unordered}"
 
@@ -134,8 +134,8 @@ def first_or_default(job: NumberJob, default: int = 0) -> int:
 
 
 # Standard ``Annotated`` keeps this valid for ordinary type checkers while
-# pyanalyzer reads it as ``Refined[int, positive]``.
-def require_positive(value: Annotated[int, positive]) -> int:
+# pyanalyzer preserves the proof tuple in the inferred type.
+def require_positive(value: Annotated[int, (positive,)]) -> int:
     return value
 
 

@@ -55,7 +55,7 @@ def test_validating_guarantee_exceptions_bubble_to_returning_function() -> None:
                 assert value > 0
                 return value
 
-            def checked(value: int) -> Annotated[int, positive]:
+            def checked(value: int) -> Annotated[int, (positive,)]:
                 return positive(value)
 
             def checked_or_zero(value: int) -> int:
@@ -69,7 +69,7 @@ def test_validating_guarantee_exceptions_bubble_to_returning_function() -> None:
 
     assert report.props[0].predicate == "value > 0"
     assert report.props[0].exceptions == ["AssertionError"]
-    assert report.functions[0].signature == "Callable[[int], Refined[int, positive]] raises AssertionError"
+    assert report.functions[0].signature == "Callable[[int], Annotated[int, (positive,)]] raises AssertionError"
     assert report.functions[1].exceptions == []
 
 
@@ -92,7 +92,7 @@ def test_text_renderer_has_spacing_and_optional_color() -> None:
     colored = _render(report, color=True)
     assert "sample.py\n\nguarantees\n" in plain
     assert "\n\nfunctions\n" in plain
-    assert "constructs: Refined[int, positive]" in plain
+    assert "constructs: Annotated[int, (positive,)]" in plain
     assert "\x1b[" not in plain
     assert "\x1b[" in colored
 
@@ -201,6 +201,73 @@ def test_annotations_and_syntax_errors() -> None:
     assert broken.errors
 
 
+def test_typeis_narrows_both_branches_and_surviving_guard_path() -> None:
+    report = analyze_source(
+        dedent(
+            """
+            from typing import TypeIs
+
+            def is_str(value: object) -> TypeIs[str]:
+                return isinstance(value, str)
+
+            def inspect(value: int | str):
+                if is_str(value):
+                    text = value
+                else:
+                    number = value
+
+                if not is_str(value):
+                    negated_number = value
+                else:
+                    negated_text = value
+
+            def after_guard(value: int | str):
+                if not is_str(value):
+                    return 0
+                text = value
+            """
+        )
+    )
+
+    inspect = report.functions[1]
+    assert inspect.variables["text"].inferred == "str"
+    assert inspect.variables["number"].inferred == "int"
+    assert inspect.variables["negated_text"].inferred == "str"
+    assert inspect.variables["negated_number"].inferred == "int"
+    assert inspect.refinements[0].variable == "value"
+    assert inspect.refinements[0].checker == "is_str"
+    assert inspect.refinements[0].when_true == "str"
+    assert inspect.refinements[0].when_false == "int"
+    assert report.functions[2].variables["text"].inferred == "str"
+
+
+def test_typeis_preserves_subtypes_when_intersecting_local_classes() -> None:
+    report = analyze_source(
+        dedent(
+            """
+            from typing import TypeIs
+
+            class Parent: ...
+            class Child(Parent): ...
+            class Unrelated: ...
+
+            def is_parent(value: object) -> TypeIs[Parent]:
+                return isinstance(value, Parent)
+
+            def inspect(value: Child | Unrelated):
+                if is_parent(value):
+                    child = value
+                else:
+                    unrelated = value
+            """
+        )
+    )
+
+    inspect = report.functions[1]
+    assert inspect.variables["child"].inferred == "Child"
+    assert inspect.variables["unrelated"].inferred == "Unrelated"
+
+
 # --- Inheritance and refinements -------------------------------------------
 
 def test_super_calls_traverse_base_methods() -> None:
@@ -253,28 +320,30 @@ def test_guarantees_refine_identity_transform_results_and_annotations() -> None:
 
             def inspect(number: int):
                 one = positive(number)
+                literal = positive(1)
                 ordered = odd(positive(number))
                 unordered = join(number, (positive, odd))
 
-            def accepts_positive(number: Annotated[int, positive]):
+            def accepts_positive(number: Annotated[int, (positive,)]):
                 return number
             """
         )
     )
 
     props = {prop.name: prop for prop in report.props}
-    assert props["positive"].returns == "int"
+    assert props["positive"].returns == "Annotated[int, (positive,)]"
     assert props["positive"].predicate is None
-    assert props["positive"].constructed_type == "Refined[int, positive]"
+    assert props["positive"].constructed_type == "Annotated[int, (positive,)]"
 
     inspect = report.functions[0]
-    assert inspect.variables["one"].inferred == "Refined[int, positive]"
-    assert inspect.variables["ordered"].inferred == "Refined[Refined[int, positive], odd]"
-    assert inspect.variables["unordered"].inferred == "Refined[int, {odd, positive}]"
-    assert report.functions[1].parameters["number"] == "Refined[int, positive]"
+    assert inspect.variables["one"].inferred == "Annotated[int, (positive,)]"
+    assert inspect.variables["literal"].inferred == "Annotated[int, (positive,)]"
+    assert inspect.variables["ordered"].inferred == "Annotated[int, (positive, odd)]"
+    assert inspect.variables["unordered"].inferred == "Annotated[int, (positive, odd)]"
+    assert report.functions[1].parameters["number"] == "Annotated[int, (positive,)]"
 
 
-def test_join_deduplicates_and_stably_orders_guarantees() -> None:
+def test_join_deduplicates_and_preserves_guarantee_order() -> None:
     report = analyze_source(
         dedent(
             """
@@ -291,7 +360,7 @@ def test_join_deduplicates_and_stably_orders_guarantees() -> None:
         )
     )
 
-    assert report.variables["value"].inferred == "Refined[Literal[1], {odd, positive}]"
+    assert report.variables["value"].inferred == "Annotated[int, (positive, odd)]"
 
 
 # --- Exception effects ------------------------------------------------------

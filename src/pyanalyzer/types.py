@@ -89,6 +89,70 @@ def _type_arguments(value: str) -> list[str]:
     return parts
 
 
+def union_members(type_name: str) -> list[str]:
+    """Return top-level members from ``Union[...]`` or a PEP 604 union."""
+    if type_name.startswith("Union[") and type_name.endswith("]"):
+        return _type_arguments(type_name[6:-1])
+
+    parts: list[str] = []
+    depth = 0
+    quote = ""
+    escaped = False
+    start = 0
+    for index, character in enumerate(type_name):
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+        elif character in {"'", '"'}:
+            quote = character
+        elif character in "[({":
+            depth += 1
+        elif character in "])}":
+            depth -= 1
+        elif character == "|" and depth == 0:
+            parts.append(type_name[start:index].strip())
+            start = index + 1
+    if parts:
+        parts.append(type_name[start:].strip())
+        return parts
+    return [type_name]
+
+
+def annotated_proof_type(base: str, guarantees: Iterable[str]) -> str:
+    """Build one normalized ``Annotated`` type carrying guarantee proofs.
+
+    The first argument is always the unannotated base type.  If *base* already
+    carries pyanalyzer's tuple-shaped proof metadata, its proofs are retained
+    and the new guarantees are appended in stable, de-duplicated order.
+    """
+    existing: list[str] = []
+    if base.startswith("Annotated[") and base.endswith("]"):
+        arguments = _type_arguments(base[len("Annotated["):-1])
+        if len(arguments) == 2:
+            metadata = arguments[1]
+            if metadata.startswith("(") and metadata.endswith(")"):
+                base = arguments[0]
+                existing = [
+                    item for item in _type_arguments(metadata[1:-1]) if item
+                ]
+    base = promote_literal(base)
+
+    proofs: list[str] = []
+    for proof in [*existing, *guarantees]:
+        if proof and proof not in proofs:
+            proofs.append(proof)
+    if not proofs:
+        return base
+    metadata = ", ".join(proofs)
+    if len(proofs) == 1:
+        metadata += ","
+    return f"Annotated[{base}, ({metadata})]"
+
+
 def callable_return(signature: str) -> str:
     if not signature.startswith("Callable["):
         return "Unknown"
@@ -244,12 +308,12 @@ class ExpressionInferer:
         known = self.infer(node.func)
         prop = self.props.get(name) or self.props.get(name.rsplit(".", 1)[-1])
         if prop is not None and node.args:
-            return f"Refined[{self.infer(node.args[0])}, {prop.name}]"
+            return annotated_proof_type(self.infer(node.args[0]), [prop.name])
         if name.rsplit(".", 1)[-1] == "join" and node.args and not known.startswith("Callable["):
             guarantees = self._join_guarantees(node.args[1]) if len(node.args) > 1 else []
             value = self.infer(node.args[0])
             if guarantees:
-                return f"Refined[{value}, {{{', '.join(guarantees)}}}]"
+                return annotated_proof_type(value, guarantees)
             return value
         constructors = {
             "str": "str", "int": "int", "float": "float", "complex": "complex",
@@ -270,10 +334,10 @@ class ExpressionInferer:
         """Return recognized guarantees in a stable order for ``join``."""
         if not isinstance(node, (ast.Tuple, ast.List, ast.Set)):
             return []
-        names: set[str] = set()
+        names: list[str] = []
         for item in node.elts:
             name = source_name(item)
             prop = self.props.get(name) or self.props.get(name.rsplit(".", 1)[-1])
-            if prop is not None:
-                names.add(prop.name)
-        return sorted(names)
+            if prop is not None and prop.name not in names:
+                names.append(prop.name)
+        return names

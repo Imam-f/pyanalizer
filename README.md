@@ -18,7 +18,8 @@ It reports:
   return types from resolved base methods;
 - class member origins (class body, `__init__`, and other methods), plus
   flattened inherited class variables, instance attributes, and methods;
-- identity `@guarantee` declarations that construct refinement types;
+- identity `@guarantee` declarations that return proof-carrying `Annotated` types;
+- branch-sensitive narrowing through user-defined `TypeIs` predicates;
 - nested-function captures, including `single` versus `shared` and `mutable`
   versus `read-only` captures.
 - explicit function exceptions and their propagation through same-file callers,
@@ -181,20 +182,41 @@ cooperative `super()` calls. External or dynamically selected bases remain
 explicitly unresolved.
 
 Functions decorated with `@guarantee` are guarantees and implicit
-refinement-type constructors. A guarantee accepts a value and returns that
-exact value at runtime after executing its declaration. Put an `assert` in the
+proof-type constructors. A guarantee accepts a value and returns that exact
+value at runtime after executing its declaration. Put an `assert` in the
 declaration to enforce the guarantee; a failed check raises `AssertionError`.
-The declaration still returns the original value. The decorator creates a generic `Guarantee[T]` callable,
-so ordinary type checkers see the decorated object as accepting and returning
-the original value type. For pyanalyzer,
-`positive(value)` is reported as `Refined[int, positive]`, while
-`odd(positive(value))` preserves the ordered composition as
-`Refined[Refined[int, positive], odd]`. Use `join(value, (odd, positive))`
-when the guarantees are unordered; it checks every guarantee and is reported
-as `Refined[int, {odd, positive}]`. For a refinement annotation that
-also passes ordinary type checking, use `Annotated[int, positive]`; the type
-checker treats it as `int`, while pyanalyzer reports `Refined[int, positive]`.
+The decorator creates a generic `Guarantee[T]` callable, so ordinary type
+checkers still see the decorated object as accepting and returning the original
+value type. Pyanalyzer reports the additional proof as standard `Annotated`
+metadata: `positive(value)` is `Annotated[int, (positive,)]`. Applying another
+guarantee keeps the base type first and appends to the proof tuple, so
+`odd(positive(value))` is `Annotated[int, (positive, odd)]`. Likewise,
+`join(value, (positive, odd))` checks each guarantee and returns
+`Annotated[int, (positive, odd)]`. Repeated guarantees are de-duplicated while
+retaining their first occurrence. Explicit annotations use the same shape,
+`Annotated[int, (positive,)]`, which ordinary type checkers treat as `int`.
 `prop` remains a compatibility alias for `guarantee`.
+
+Functions returning `TypeIs[T]` narrow their first argument when used as a
+condition. Pyanalyzer narrows both branches: the true branch intersects the
+argument's existing type with `T`, and the false branch excludes `T` where the
+remaining type can be represented. It preserves known local subclasses,
+understands `not` and direct boolean comparisons, and carries narrowing past a
+guard whose other branch returns or raises.
+
+```python
+from typing import TypeIs
+
+def is_text(value: object) -> TypeIs[str]:
+    return isinstance(value, str)
+
+def consume(value: int | str) -> str:
+    if is_text(value):
+        # value: str
+        return value.strip()
+    # value: int
+    return str(value)
+```
 
 Exception effects are appended to callable types. A function that explicitly
 raises `ValueError` is shown as `Callable[..., T] raises ValueError`, and a
@@ -223,7 +245,7 @@ def odd(value: int) -> int:
 ordered = odd(positive(number))
 unordered = join(number, (odd, positive))
 
-def require_positive(value: Annotated[int, positive]) -> int:
+def require_positive(value: Annotated[int, (positive,)]) -> int:
     return value
 ```
 
