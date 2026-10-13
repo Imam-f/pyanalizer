@@ -153,6 +153,20 @@ def annotated_proof_type(base: str, guarantees: Iterable[str]) -> str:
     return f"Annotated[{base}, ({metadata})]"
 
 
+def proof_type_parts(type_name: str) -> tuple[str, list[str]]:
+    """Return the base and proofs from a normalized proof annotation."""
+    if type_name.startswith("Annotated[") and type_name.endswith("]"):
+        arguments = _type_arguments(type_name[len("Annotated["):-1])
+        if len(arguments) == 2:
+            metadata = arguments[1]
+            if metadata.startswith("(") and metadata.endswith(")"):
+                proofs = [
+                    item for item in _type_arguments(metadata[1:-1]) if item
+                ]
+                return arguments[0], proofs
+    return type_name, []
+
+
 def callable_return(signature: str) -> str:
     if not signature.startswith("Callable["):
         return "Unknown"
@@ -315,6 +329,8 @@ class ExpressionInferer:
             if guarantees:
                 return annotated_proof_type(value, guarantees)
             return value
+        if name.rsplit(".", 1)[-1] == "is_" and len(node.args) > 1:
+            return "bool"
         constructors = {
             "str": "str", "int": "int", "float": "float", "complex": "complex",
             "bool": "bool", "bytes": "bytes", "list": "list[Unknown]",

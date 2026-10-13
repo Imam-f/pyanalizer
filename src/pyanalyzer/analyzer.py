@@ -28,6 +28,7 @@ from .stubs import StubResolver
 from .types import (
     ExpressionInferer,
     annotated_proof_type,
+    proof_type_parts,
     promote_literal,
     source_name,
     union,
@@ -84,7 +85,8 @@ class _ScopeResult:
 class _TypeNarrower:
     name: str
     qualified_name: str
-    narrowed_type: str
+    narrowed_type: str | None = None
+    guarantees: tuple[str, ...] = ()
 
 
 def analyze_file(
@@ -861,19 +863,19 @@ class _Analyzer:
             if not isinstance(statement, ast.If):
                 continue
             for call, narrower, true_state, false_state in _condition_typeis_calls(
-                statement.test, self._type_narrowers
+                statement.test, self._type_narrowers, self._props
             ):
                 argument = call.args[0]
                 if not isinstance(argument, ast.Name):
                     continue
                 original = symbols.get(argument.id, "Unknown")
                 when_true = (
-                    self._narrow_type(original, narrower.narrowed_type, true_state)
+                    self._apply_narrower(original, narrower, true_state)
                     if true_state is not None
                     else None
                 )
                 when_false = (
-                    self._narrow_type(original, narrower.narrowed_type, false_state)
+                    self._apply_narrower(original, narrower, false_state)
                     if false_state is not None
                     else None
                 )
@@ -897,16 +899,30 @@ class _Analyzer:
         condition_is_true: bool,
     ) -> None:
         for call, narrower, true_state, false_state in _condition_typeis_calls(
-            condition, self._type_narrowers
+            condition, self._type_narrowers, self._props
         ):
             state = true_state if condition_is_true else false_state
             if state is None or not isinstance(call.args[0], ast.Name):
                 continue
             variable = call.args[0].id
             original = symbols.get(variable, "Unknown")
-            symbols[variable] = self._narrow_type(
-                original, narrower.narrowed_type, state
+            symbols[variable] = self._apply_narrower(original, narrower, state)
+
+    def _apply_narrower(
+        self,
+        original: str,
+        narrower: _TypeNarrower,
+        positive: bool,
+    ) -> str:
+        if narrower.guarantees:
+            return (
+                annotated_proof_type(original, narrower.guarantees)
+                if positive
+                else original
             )
+        if narrower.narrowed_type is None:
+            return original
+        return self._narrow_type(original, narrower.narrowed_type, positive)
 
     @staticmethod
     def _merge_branch_symbols(
@@ -930,7 +946,17 @@ class _Analyzer:
         for name in set().union(*(branch.keys() for branch in branches)):
             values = [branch[name] for branch in branches if name in branch]
             if values:
-                symbols[name] = union(values, widen_literals=False)
+                parts = [proof_type_parts(value) for value in values]
+                bases = [base for base, _ in parts]
+                if len(set(values)) > 1 and len(set(bases)) == 1:
+                    common = [
+                        proof
+                        for proof in parts[0][1]
+                        if all(proof in proofs for _, proofs in parts[1:])
+                    ]
+                    symbols[name] = annotated_proof_type(bases[0], common)
+                else:
+                    symbols[name] = union(values, widen_literals=False)
 
     def _narrow_type(self, original: str, target: str, positive: bool) -> str:
         original_members = union_members(original)
@@ -1081,7 +1107,11 @@ class _Analyzer:
 
             for effect_node in _direct_effect_nodes(statement):
                 if isinstance(effect_node, ast.Call):
-                    result.update(self._join_exception_effects(effect_node, effects))
+                    result.update(
+                        self._guarantee_collection_exception_effects(
+                            effect_node, effects
+                        )
+                    )
                     callee = self._resolve_call(effect_node, caller, owner_class)
                     if callee is not None:
                         result.update(effects.get(callee, set()))
@@ -1098,12 +1128,13 @@ class _Analyzer:
                 )
         return result
 
-    def _join_exception_effects(
+    def _guarantee_collection_exception_effects(
         self,
         call: ast.Call,
         effects: dict[str, set[str]],
     ) -> set[str]:
-        if source_name(call.func).rsplit(".", 1)[-1] != "join" or len(call.args) < 2:
+        helper = source_name(call.func).rsplit(".", 1)[-1]
+        if helper not in {"is_", "join"} or len(call.args) < 2:
             return set()
         guarantees = call.args[1]
         if not isinstance(guarantees, (ast.Tuple, ast.List, ast.Set)):
@@ -1114,6 +1145,8 @@ class _Analyzer:
             prop = self._props.get(name) or self._props.get(name.rsplit(".", 1)[-1])
             if prop is not None:
                 result.update(effects.get(prop.qualified_name, set()))
+        if helper == "is_":
+            result.discard("AssertionError")
         return result
 
     def _exceptions_in_try(
@@ -1602,8 +1635,9 @@ def _super_method_name(node: ast.AST | None) -> str | None:
 def _condition_typeis_calls(
     node: ast.AST,
     narrowers: dict[str, _TypeNarrower],
+    props: dict[str, PropReport],
 ) -> list[tuple[ast.Call, _TypeNarrower, bool | None, bool | None]]:
-    """Find ``TypeIs`` calls and map condition truth to predicate truth.
+    """Find narrowing calls and map condition truth to predicate truth.
 
     Each tuple contains ``(call, narrower, state_when_condition_true,
     state_when_condition_false)``. ``None`` means the compound boolean does not
@@ -1614,18 +1648,33 @@ def _condition_typeis_calls(
         narrower = narrowers.get(name) or narrowers.get(name.rsplit(".", 1)[-1])
         if narrower is not None:
             return [(node, narrower, True, False)]
+        if name.rsplit(".", 1)[-1] == "is_" and len(node.args) > 1:
+            guarantees = _guarantees_from_collection(node.args[1], props)
+            if guarantees:
+                return [
+                    (
+                        node,
+                        _TypeNarrower(
+                            name="is_",
+                            qualified_name=name,
+                            guarantees=tuple(guarantees),
+                        ),
+                        True,
+                        False,
+                    )
+                ]
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
         return [
             (call, narrower, false_state, true_state)
             for call, narrower, true_state, false_state in _condition_typeis_calls(
-                node.operand, narrowers
+                node.operand, narrowers, props
             )
         ]
     if isinstance(node, ast.BoolOp):
         children = [
             item
             for value in node.values
-            for item in _condition_typeis_calls(value, narrowers)
+            for item in _condition_typeis_calls(value, narrowers, props)
         ]
         if isinstance(node.op, ast.And):
             return [
@@ -1645,7 +1694,7 @@ def _condition_typeis_calls(
         and isinstance(node.comparators[0].value, bool)
         and isinstance(node.ops[0], (ast.Eq, ast.Is, ast.NotEq, ast.IsNot))
     ):
-        direct = _condition_typeis_calls(node.left, narrowers)
+        direct = _condition_typeis_calls(node.left, narrowers, props)
         if not direct:
             return []
         expected = node.comparators[0].value
@@ -1656,6 +1705,22 @@ def _condition_typeis_calls(
             for call, narrower, _, _ in direct
         ]
     return []
+
+
+def _guarantees_from_collection(
+    node: ast.AST,
+    props: dict[str, PropReport],
+) -> list[str]:
+    """Return known guarantees from a tuple or list in source order."""
+    if not isinstance(node, (ast.Tuple, ast.List)):
+        return []
+    guarantees: list[str] = []
+    for item in node.elts:
+        name = source_name(item)
+        guarantee = props.get(name) or props.get(name.rsplit(".", 1)[-1])
+        if guarantee is not None and guarantee.name not in guarantees:
+            guarantees.append(guarantee.name)
+    return guarantees
 
 
 def _body_terminates(body: list[ast.stmt]) -> bool:

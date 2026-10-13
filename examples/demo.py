@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from typing import Annotated, Literal, TypeIs
 
-from pyanalyzer import guarantee, join
+from pyanalyzer import guarantee, is_, join
 
 
 # --- Bindings and mutable state ---------------------------------------------
@@ -105,6 +105,18 @@ def positive_result(value: int) -> Annotated[int, (positive,)]:
 def positive_odd_result(value: int) -> Annotated[int, (positive, odd)]:
     """Return type: Annotated[int, (positive, odd)]."""
     return join(value, (positive, odd))
+
+
+def describe_proven_number(value: int) -> str:
+    if is_(value, [positive, odd]):
+        # proven_value: Annotated[int, (positive, odd)]
+        proven_value = value
+        return f"positive odd number: {proven_value}"
+
+    # A false result keeps the original base type because either proof may
+    # have failed.
+    unproven_value = value
+    return f"unproven number: {unproven_value}"
 
 
 # --- Classes and inheritance ------------------------------------------------

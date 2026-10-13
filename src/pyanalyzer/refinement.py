@@ -58,3 +58,22 @@ def join(value: Value, guarantees: Iterable[Guarantee[Any]]) -> Value:
     for check in guarantees:
         check(value)
     return value
+
+
+def is_(
+    value: Value,
+    guarantees: tuple[Guarantee[Any], ...] | list[Guarantee[Any]],
+) -> bool:
+    """Return whether *value* satisfies every supplied guarantee.
+
+    Failed assertions become ``False`` so this helper can be used as a type
+    narrowing condition. Unexpected exceptions raised by a guarantee still
+    propagate. Pyanalyzer attaches the successful guarantees as proof metadata
+    on the true branch.
+    """
+    try:
+        for check in guarantees:
+            check(value)
+    except AssertionError:
+        return False
+    return True

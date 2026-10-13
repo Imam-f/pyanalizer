@@ -4,7 +4,7 @@ from textwrap import dedent
 
 import pytest
 
-from pyanalyzer import Guarantee, analyze_source, guarantee, join, prop
+from pyanalyzer import Guarantee, analyze_source, guarantee, is_, join, prop
 from pyanalyzer.cli import _render
 
 
@@ -38,6 +38,10 @@ def test_asserting_guarantees_perform_real_runtime_checks() -> None:
     assert positive(3) == 3
     assert odd(3) == 3
     assert join(3, (positive, odd)) == 3
+    assert is_(3, (positive, odd)) is True
+    assert is_(3, [positive, odd]) is True
+    assert is_(2, (positive, odd)) is False
+    assert is_(-1, [positive, odd]) is False
     with pytest.raises(AssertionError, match="positive"):
         positive(-1)
     with pytest.raises(AssertionError, match="odd"):
@@ -286,6 +290,83 @@ def test_typeis_preserves_subtypes_when_intersecting_local_classes() -> None:
     inspect_method = report.functions[2]
     assert inspect_method.variables["child"].inferred == "Child"
     assert inspect_method.variables["unrelated"].inferred == "Unrelated"
+
+
+def test_is_narrows_with_tuple_or_list_of_guarantees() -> None:
+    report = analyze_source(
+        dedent(
+            """
+            from typing import Annotated
+            from pyanalyzer import guarantee, is_
+
+            @guarantee
+            def positive(value: int) -> int:
+                assert value > 0
+                return value
+
+            @guarantee
+            def odd(value: int) -> int:
+                assert value % 2
+                return value
+
+            @guarantee
+            def readable(value: int) -> int:
+                if value == 0:
+                    raise ValueError("unreadable")
+                return value
+
+            def inspect(value: int):
+                if is_(value, (positive, odd)):
+                    tuple_proven = value
+                else:
+                    tuple_unproven = value
+
+                if is_(value, [odd, positive, odd]):
+                    list_proven = value
+
+            def after_guard(value: int):
+                if not is_(value, [positive, odd]):
+                    return 0
+                proven = value
+
+            def may_fail_unexpectedly(value: int):
+                return is_(value, [positive, readable])
+
+            def extend_existing(value: Annotated[int, (positive,)]):
+                if is_(value, [odd]):
+                    positive_odd = value
+                else:
+                    still_positive = value
+                retained_positive = value
+            """
+        )
+    )
+
+    inspect = report.functions[0]
+    assert inspect.variables["tuple_proven"].inferred == (
+        "Annotated[int, (positive, odd)]"
+    )
+    assert inspect.variables["tuple_unproven"].inferred == "int"
+    assert inspect.variables["list_proven"].inferred == (
+        "Annotated[int, (odd, positive)]"
+    )
+    assert inspect.refinements[0].checker == "is_"
+    assert inspect.refinements[0].when_true == "Annotated[int, (positive, odd)]"
+    assert inspect.refinements[0].when_false == "int"
+    assert report.functions[1].variables["proven"].inferred == (
+        "Annotated[int, (positive, odd)]"
+    )
+    assert report.functions[2].exceptions == ["ValueError"]
+    extend = report.functions[3]
+    assert extend.variables["positive_odd"].inferred == (
+        "Annotated[int, (positive, odd)]"
+    )
+    assert extend.variables["still_positive"].inferred == (
+        "Annotated[int, (positive,)]"
+    )
+    assert extend.variables["retained_positive"].inferred == (
+        "Annotated[int, (positive,)]"
+    )
 
 
 # --- Inheritance and refinements -------------------------------------------

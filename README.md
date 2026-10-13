@@ -154,6 +154,51 @@ report = analyze_source("from dependency import read\nresult = read()",
                         stub_paths=["stubs"])
 ```
 
+## Typed C-style prelude
+
+`pyanalyzer.prelude` provides runnable, fully annotated Python classes and common
+C-style library helpers. Its companion `.pyi` lets `--use-stubs` resolve the same
+API without running it.
+
+```python
+from pyanalyzer.prelude import c_uint, atoi, malloc, strcpy, strlen, sqrt
+
+wrapped = c_uint(-1)        # Native unsigned-int width; usually 4294967295.
+number = atoi(" 42 items")  # c_int(42)
+root = sqrt(9)             # c_double(3.0)
+buffer = malloc(16)
+strcpy(buffer, b"hello")
+length = strlen(buffer)    # c_size_t(5)
+assert number.value == 42
+```
+
+The scalar classes cover booleans, byte/wide characters, signed and unsigned C
+integers, `size_t`/`ptrdiff_t`, fixed-width `int8_t` through `uint64_t`, and floating
+point types. `sizeof` reports native scalar widths or a byte buffer's length.
+Helpers include decimal conversions, allocation and memory operations,
+NUL-terminated byte-string operations, common math functions, and
+`printf`/`puts`/`putchar`. Try the complete example:
+
+```console
+uv run python examples/prelude_demo.py
+uv run pyanalyzer --use-stubs examples/prelude_demo.py
+```
+
+These are Python simulations. Scalars are immutable, and `.value` is read-only.
+Integer construction wraps to the declared width; arithmetic returns ordinary
+Python numbers, so cast a result explicitly to wrap it again. `c_float` rounds on
+construction; `c_longdouble` uses Python double precision while `sizeof` reports
+its native C storage size. Buffers are zero-filled `bytearray` objects rather
+than native pointers. Operations raise `ValueError` on negative sizes or capacity
+violations, `realloc` resizes in place, and `free` clears the buffer. Byte-string
+inputs may omit a trailing NUL; copy helpers supply or pad it as documented.
+Conversions implement decimal prefixes, without locale or hexadecimal parsing.
+Math errors raise Python exceptions. `printf` uses Python `%` formatting and
+counts UTF-8 bytes, and does not support C length modifiers or pointer formatting.
+Output uses Python text streams; `putchar` emits its low byte as a Unicode
+character. These helpers do not expose native allocation, ABI calls, or C's
+undefined behavior.
+
 ## Interpretation and limits
 
 The tool records exact literal observations, then widens them for ordinary
@@ -197,6 +242,13 @@ retaining their first occurrence. Explicit annotations use the same shape,
 `Annotated[int, (positive,)]`, which ordinary type checkers treat as `int`.
 `prop` remains a compatibility alias for `guarantee`.
 
+Use `is_(value, (positive, odd))` as a conditional proof check. (`is` is a
+Python keyword, so the callable uses the conventional trailing underscore.) It
+accepts either a tuple or list of guarantees, returns `False` when one of their
+assertions fails, and narrows the true branch to
+`Annotated[int, (positive, odd)]`. The false branch retains the base `int`
+because it cannot determine which guarantee failed.
+
 Functions returning `TypeIs[T]` narrow their first argument when used as a
 condition. Pyanalyzer narrows both branches: the true branch intersects the
 argument's existing type with `T`, and the false branch excludes `T` where the
@@ -230,7 +282,7 @@ undocumented exceptions from external functions or ordinary Python operators.
 ```python
 from typing import Annotated
 
-from pyanalyzer import guarantee, join
+from pyanalyzer import guarantee, is_, join
 
 @guarantee
 def positive(value: int) -> int:
@@ -244,6 +296,9 @@ def odd(value: int) -> int:
 
 ordered = odd(positive(number))
 unordered = join(number, (odd, positive))
+
+if is_(number, [positive, odd]):
+    proven = number  # Annotated[int, (positive, odd)]
 
 def require_positive(value: Annotated[int, (positive,)]) -> int:
     return value
