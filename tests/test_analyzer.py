@@ -213,8 +213,12 @@ def test_typeis_narrows_both_branches_and_surviving_guard_path() -> None:
             def inspect(value: int | str):
                 if is_str(value):
                     text = value
+                    branch_value = value
+                    text_copy = branch_value
                 else:
                     number = value
+                    branch_value = value
+                    number_copy = branch_value
 
                 if not is_str(value):
                     negated_number = value
@@ -232,6 +236,9 @@ def test_typeis_narrows_both_branches_and_surviving_guard_path() -> None:
     inspect = report.functions[1]
     assert inspect.variables["text"].inferred == "str"
     assert inspect.variables["number"].inferred == "int"
+    assert inspect.variables["branch_value"].inferred == "Union[str, int]"
+    assert inspect.variables["text_copy"].inferred == "str"
+    assert inspect.variables["number_copy"].inferred == "int"
     assert inspect.variables["negated_text"].inferred == "str"
     assert inspect.variables["negated_number"].inferred == "int"
     assert inspect.refinements[0].variable == "value"
@@ -254,8 +261,18 @@ def test_typeis_preserves_subtypes_when_intersecting_local_classes() -> None:
             def is_parent(value: object) -> TypeIs[Parent]:
                 return isinstance(value, Parent)
 
+            class Checker:
+                def accepts_parent(self, value: object) -> TypeIs[Parent]:
+                    return isinstance(value, Parent)
+
             def inspect(value: Child | Unrelated):
                 if is_parent(value):
+                    child = value
+                else:
+                    unrelated = value
+
+            def inspect_method(checker: Checker, value: Child | Unrelated):
+                if checker.accepts_parent(value):
                     child = value
                 else:
                     unrelated = value
@@ -266,6 +283,9 @@ def test_typeis_preserves_subtypes_when_intersecting_local_classes() -> None:
     inspect = report.functions[1]
     assert inspect.variables["child"].inferred == "Child"
     assert inspect.variables["unrelated"].inferred == "Unrelated"
+    inspect_method = report.functions[2]
+    assert inspect_method.variables["child"].inferred == "Child"
+    assert inspect_method.variables["unrelated"].inferred == "Unrelated"
 
 
 # --- Inheritance and refinements -------------------------------------------

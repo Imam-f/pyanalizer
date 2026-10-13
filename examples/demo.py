@@ -1,7 +1,7 @@
 """Run with: uv run pyanalyzer --color always examples/demo.py"""
 
 from collections.abc import Callable
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypeIs
 
 from pyanalyzer import guarantee, join
 
@@ -44,6 +44,32 @@ def make_handlers(prefix: str) -> tuple[Callable[[str], str], Callable[[], int]]
         return len(history)
 
     return format_message, count
+
+
+# --- TypeIs narrowing -------------------------------------------------------
+
+def is_text(value: object) -> TypeIs[str]:
+    return isinstance(value, str)
+
+
+def describe_identifier(value: int | str) -> str:
+    if is_text(value):
+        # The true branch intersects ``int | str`` with ``str``.
+        text_value = value
+        return text_value.upper()
+
+    # The false branch excludes ``str``, leaving ``int``.
+    number_value = value
+    return f"identifier-{number_value}"
+
+
+def normalize_text(value: int | str) -> str:
+    if not is_text(value):
+        return str(value)
+
+    # The returning guard leaves only the ``str`` path reachable here.
+    guarded_text = value
+    return guarded_text.strip()
 
 
 # --- Guarantees and refinements ---------------------------------------------

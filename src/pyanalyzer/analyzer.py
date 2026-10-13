@@ -264,7 +264,7 @@ class _Analyzer:
             dicts=result.dicts,
             captures=captures,
             super_calls=super_calls,
-            refinements=self._find_refinements(node, result.symbols, owner_class),
+            refinements=self._find_refinements(node, local_symbols, owner_class),
             props=result.props,
             nested_functions=result.functions,
         )
@@ -404,6 +404,45 @@ class _Analyzer:
             for name, value in source.items()
         }
 
+    @staticmethod
+    def _copy_facts(source: dict[str, _TypeFacts]) -> dict[str, _TypeFacts]:
+        return {
+            name: _TypeFacts(
+                observed=value.observed.copy(),
+                locations=value.locations.copy(),
+                declared=value.declared,
+                writes=value.writes,
+                mutable=value.mutable,
+            )
+            for name, value in source.items()
+        }
+
+    @staticmethod
+    def _merge_branch_facts(
+        target: dict[str, _TypeFacts],
+        *branches: dict[str, _TypeFacts],
+    ) -> None:
+        merged: dict[str, _TypeFacts] = {}
+        for name in set().union(*(branch.keys() for branch in branches)):
+            values = [branch[name] for branch in branches if name in branch]
+            item = _TypeFacts(
+                declared=next(
+                    (value.declared for value in values if value.declared), None
+                ),
+                writes=max((value.writes for value in values), default=0),
+                mutable=any(value.mutable for value in values),
+            )
+            for value in values:
+                for observed in value.observed:
+                    if observed not in item.observed:
+                        item.observed.append(observed)
+                for location in value.locations:
+                    if location not in item.locations:
+                        item.locations.append(location)
+            merged[name] = item
+        target.clear()
+        target.update(merged)
+
     def _flatten_inherited_attributes(
         self,
         base_reports: list[ClassReport],
@@ -484,12 +523,15 @@ class _Analyzer:
         if isinstance(node, ast.If):
             true_symbols = symbols.copy()
             false_symbols = symbols.copy()
+            true_facts = self._copy_facts(facts)
+            false_facts = self._copy_facts(facts)
             self._narrow_condition(node.test, true_symbols, condition_is_true=True)
             self._narrow_condition(node.test, false_symbols, condition_is_true=False)
             for child in node.body:
-                self._statement(child, facts, dicts, true_symbols, instance_attributes)
+                self._statement(child, true_facts, dicts, true_symbols, instance_attributes)
             for child in node.orelse:
-                self._statement(child, facts, dicts, false_symbols, instance_attributes)
+                self._statement(child, false_facts, dicts, false_symbols, instance_attributes)
+            self._merge_branch_facts(facts, true_facts, false_facts)
             true_reaches = not _body_terminates(node.body)
             false_reaches = not node.orelse or not _body_terminates(node.orelse)
             self._merge_branch_symbols(
