@@ -199,6 +199,54 @@ Output uses Python text streams; `putchar` emits its low byte as a Unicode
 character. These helpers do not expose native allocation, ABI calls, or C's
 undefined behavior.
 
+## Symbolic mathematics prelude
+
+`pyanalyzer.math_prelude` is a separate, fully typed equational proof system.
+`Symbol`, `Constant`, `Add`, `Mul`, and `Neg` form immutable expression trees;
+`Equality` states an equation. Python `==` compares expression structure, so
+`x + y` and `y + x` remain different expressions until related by a proof.
+
+The eight `BASIC_AXIOMS` supply addition and multiplication commutativity,
+associativity, and identities, additive inverses, and distributivity. They are
+universally quantified equation schemas: `instantiate` requires a binding for
+every symbol in the selected schema.
+
+```python
+from pyanalyzer.math_prelude import (
+    ADD_COMMUTATIVITY, ADD_IDENTITY, ZERO, Symbol, transitivity,
+)
+
+x = Symbol("x")
+commuted = ADD_COMMUTATIVITY.instantiate(x=ZERO, y=x)  # 0 + x = x + 0
+identity = ADD_IDENTITY.instantiate(x=x)              # x + 0 = x
+theorem = transitivity(commuted, identity)           # 0 + x = x
+assert theorem.check()
+print(theorem.conclusion)
+```
+
+Inference helpers provide reflexivity, symmetry, transitivity, substitution,
+and congruence (replacing equal expressions inside a context). Substitution is
+simultaneous. `calculation` proves the value of a ground expression using exact
+`Fraction` arithmetic; floating-point constants are rejected.
+
+Proof records are data, and constructing a record does not certify it.
+`Proof.check()` recursively checks its premises, rule, and conclusion against
+the built-in axioms, rejecting altered conclusions, mismatched transitivity
+steps, and cycles. Custom axioms require explicit trust through
+`proof.check(axioms=(...))`; passing an empty tuple permits only axiom-free
+derivations. The checker verifies derivations relative to the selected axioms,
+and does not establish that user-supplied axioms are consistent. This prelude
+covers equational rational arithmetic; quantifiers, induction, inequalities,
+and automated proof search are outside its scope.
+
+The companion `.pyi` supports external import inference with `--use-stubs`.
+Run the example to see derived identities and exact arithmetic:
+
+```console
+uv run python examples/math_prelude_demo.py
+uv run pyanalyzer --use-stubs examples/math_prelude_demo.py
+```
+
 ## Interpretation and limits
 
 The tool records exact literal observations, then widens them for ordinary

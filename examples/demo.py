@@ -1,9 +1,12 @@
-"""Run with: uv run pyanalyzer --color always examples/demo.py"""
+"""Run with: uv run pyanalyzer --use-stubs --color always examples/demo.py"""
 
 from collections.abc import Callable
+from fractions import Fraction
 from typing import Annotated, Literal, TypeIs
 
 from pyanalyzer import guarantee, is_, join
+from pyanalyzer import math_prelude as symbolic
+from pyanalyzer import prelude as c
 
 
 # --- Bindings and mutable state ---------------------------------------------
@@ -178,3 +181,54 @@ def require_positive(value: Annotated[int, (positive,)]) -> int:
 
 
 promoted = 2 + 0.5
+
+
+# --- Runnable C-style prelude ----------------------------------------------
+
+c_wrapped_unsigned = c.c_uint(-1)
+c_single_precision = c.c_float(0.1)
+c_parsed_integer = c.atoi(" 42 items")
+c_square_root = c.sqrt(9)
+c_integer_width = c.sizeof(c.c_uint)
+
+c_buffer = c.malloc(16)
+c.strcpy(c_buffer, b"hello")
+c.strcat(c_buffer, b"!")
+c_string_length = c.strlen(c_buffer)
+assert c_buffer[:c_string_length] == b"hello!"
+
+
+# --- Symbolic mathematical axioms and checked proofs ------------------------
+
+math_symbol = symbolic.Symbol("a")
+math_commuted = symbolic.ADD_COMMUTATIVITY.instantiate(x=symbolic.ZERO, y=math_symbol)
+math_identity = symbolic.ADD_IDENTITY.instantiate(x=math_symbol)
+
+# Derive 0 + a = a using 0 + a = a + 0 and a + 0 = a.
+math_left_identity = symbolic.transitivity(math_commuted, math_identity)
+assert math_left_identity.conclusion == symbolic.Equality(symbolic.ZERO + math_symbol, math_symbol)
+assert math_left_identity.check()
+
+# Replace equal expressions inside a larger context, then specialize a theorem.
+math_lifted_identity = symbolic.congruence(
+    math_left_identity, symbolic.Symbol("hole") * symbolic.ONE, variable="hole",
+)
+math_specialized_identity = symbolic.substitute(
+    math_left_identity, a=symbolic.Symbol("b") + symbolic.ONE,
+)
+math_reversed_identity = symbolic.symmetry(math_specialized_identity)
+assert math_lifted_identity.check()
+assert math_reversed_identity.check()
+
+# Exact ground arithmetic: 1/3 + 2/3 = 1.
+math_exact_sum = symbolic.calculation(
+    symbolic.Constant(Fraction(1, 3)) + symbolic.Constant(Fraction(2, 3)),
+)
+assert math_exact_sum.conclusion.right == symbolic.ONE
+assert math_exact_sum.check()
+
+# Constructing a proof record does not establish its conclusion.
+math_unjustified = symbolic.Proof(
+    symbolic.Equality(symbolic.ZERO, symbolic.ONE), symbolic.Rule.REFLEXIVITY,
+)
+assert not math_unjustified.check()
